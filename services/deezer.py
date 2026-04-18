@@ -4,6 +4,13 @@ Leitura e escrita no Deezer via OAuth token ou ARL
 """
 import requests
 
+try:
+    import browser_cookie3
+    BROWSER_COOKIE3_AVAILABLE = True
+except ImportError:
+    browser_cookie3 = None
+    BROWSER_COOKIE3_AVAILABLE = False
+
 DEEZER_GW = "https://www.deezer.com/ajax/gw-light.php"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
@@ -170,3 +177,61 @@ def add_tracks(session: requests.Session, api_token: str, playlist_id: int, trac
             "playlist_id": playlist_id,
             "songs": [[tid, idx] for idx, tid in enumerate(chunk, i)],
         })
+
+
+def _available_cookie_loaders() -> list[tuple[str, object]]:
+    if not BROWSER_COOKIE3_AVAILABLE:
+        return []
+
+    browser_names = [
+        ("Chrome", "chrome"),
+        ("Edge", "edge"),
+        ("Brave", "brave"),
+        ("Firefox", "firefox"),
+        ("Opera", "opera"),
+        ("Vivaldi", "vivaldi"),
+    ]
+    loaders = []
+    for label, attr in browser_names:
+        loader = getattr(browser_cookie3, attr, None)
+        if callable(loader):
+            loaders.append((label, loader))
+    return loaders
+
+
+def read_saved_arl() -> dict:
+    """
+    Tenta ler o cookie ARL salvo em navegadores instalados no computador.
+    Recurso local, pensado para a instÃ¢ncia desktop do app.
+    """
+    if not BROWSER_COOKIE3_AVAILABLE:
+        raise ValueError(
+            "A leitura automatica do navegador ainda nao esta instalada nesta instalacao."
+        )
+
+    errors = []
+
+    for browser_name, loader in _available_cookie_loaders():
+        try:
+            jar = loader(domain_name="deezer.com")
+        except Exception as exc:
+            errors.append((browser_name, type(exc).__name__, str(exc)))
+            continue
+
+        for cookie in jar:
+            if cookie.name.lower() == "arl" and cookie.value:
+                return {"arl": cookie.value.strip(), "browser": browser_name}
+
+    chrome_blocked = any(
+        browser_name == "Chrome" and error_type == "RequiresAdminError"
+        for browser_name, error_type, _ in errors
+    )
+    if chrome_blocked:
+        raise ValueError(
+            "O Chrome desta maquina bloqueou a leitura automatica do Deezer."
+        )
+
+    raise ValueError(
+        "Nao encontrei o cookie arl do Deezer nos navegadores desta maquina. "
+        "Abra o Deezer ja logado em Chrome, Edge ou Firefox e tente novamente."
+    )

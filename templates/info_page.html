@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{{ page.title }} — PlayTransfer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}" />
+</head>
+<body>
+  <div class="bg-orbs"></div>
+
+  <nav>
+    <a href="/" class="nav-logo">PlayTransfer</a>
+    <div class="nav-actions">
+      <span class="nav-badge beta">Info</span>
+    </div>
+  </nav>
+
+  <main class="app-container" style="padding-top: 32px; padding-bottom: 48px;">
+    <div class="card" style="max-width: 860px; margin: 0 auto;">
+      <div class="card-title">{{ page.title }}</div>
+      <div class="card-subtitle">{{ page.subtitle }}</div>
+
+      {% for section in page.sections %}
+      <section style="margin-top: 22px;">
+        <h2 style="font-size: 1rem; margin-bottom: 8px;">{{ section.title }}</h2>
+        <p style="line-height: 1.7; color: var(--color-muted); margin: 0;">{{ section.body }}</p>
+      </section>
+      {% endfor %}
+
+      <div style="margin-top: 28px;">
+        <a href="/" class="btn btn-primary">← Voltar ao app</a>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

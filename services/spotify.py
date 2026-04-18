@@ -1,224 +1,460 @@
 """
-services/spotify.py — PlayTransfer
-Leitura de playlists do Spotify via embed público e cookie sp_dc
+Spotify helpers for PlayTransfer.
 """
-import os, re, json, time, requests
 
-_token_cache: dict = {"token": None, "expires": 0}
+import json
+import os
+import re
+import time
 
-UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+import requests
+
+_token_cache: dict = {"token": None, "expires": 0, "key": None}
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
+
+def _as_clean_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("message", "error_description", "error", "detail"):
+            nested = _as_clean_text(value.get(key))
+            if nested:
+                return nested
+        try:
+            return json.dumps(value, ensure_ascii=False).strip()
+        except Exception:
+            return str(value).strip()
+    if isinstance(value, (list, tuple, set)):
+        parts = [_as_clean_text(item) for item in value]
+        return " | ".join(part for part in parts if part)
+    return str(value).strip()
+
+
+def _is_placeholder_sp_dc(value: str | None) -> bool:
+    normalized = _as_clean_text(value).lower()
+    return normalized in {
+        "",
+        "seu_sp_dc_aqui",
+        "your_sp_dc_here",
+        "cole_seu_sp_dc_aqui",
+        "sp_dc_aqui",
+    }
 
 
 def _get_sp_dc() -> str:
-    sp_dc = os.getenv("SPOTIFY_SP_DC", "").strip()
+    sp_dc = _as_clean_text(os.getenv("SPOTIFY_SP_DC", ""))
     if not sp_dc:
         try:
-            with open(".env", "r") as f:
-                for line in f:
+            with open(".env", "r", encoding="utf-8") as env_file:
+                for line in env_file:
                     if line.strip().startswith("SPOTIFY_SP_DC="):
-                        sp_dc = line.strip().split("=", 1)[1].strip()
+                        sp_dc = _as_clean_text(line.strip().split("=", 1)[1])
         except Exception:
             pass
-    return sp_dc
+    return "" if _is_placeholder_sp_dc(sp_dc) else sp_dc
 
 
-def get_token_via_sp_dc(sp_dc: str) -> str:
-    """Obtém access token do Spotify via cookie sp_dc (sem Playwright)."""
-    if _token_cache["token"] and _token_cache["expires"] > time.time() + 60:
+def _normalize_cookie_header(cookie_header: str | None) -> str:
+    raw = _as_clean_text(cookie_header)
+    if not raw:
+        return ""
+    if raw.lower().startswith("cookie:"):
+        raw = raw.split(":", 1)[1].strip()
+    return raw
+
+
+def _extract_sp_dc(value: str | None) -> str:
+    raw = _as_clean_text(value)
+    if not raw:
+        return ""
+    if "sp_dc=" in raw:
+        raw = raw.split("sp_dc=", 1)[1].split(";", 1)[0].strip()
+    return "" if _is_placeholder_sp_dc(raw) else raw
+
+
+def get_token_via_sp_dc(sp_dc: str = None, cookie_header: str = None) -> str:
+    """Get a Spotify access token from sp_dc or a full Cookie header."""
+    normalized_cookie_header = _normalize_cookie_header(cookie_header)
+    normalized_sp_dc = _extract_sp_dc(sp_dc) or _extract_sp_dc(normalized_cookie_header) or _get_sp_dc()
+    cache_key = normalized_cookie_header or normalized_sp_dc
+
+    if (
+        _token_cache["token"]
+        and _token_cache["expires"] > time.time() + 60
+        and _token_cache.get("key") == cache_key
+    ):
         return _token_cache["token"]
 
-    r = requests.get(
+    if not normalized_sp_dc and not normalized_cookie_header:
+        raise ValueError("Cookie do Spotify nao fornecido.")
+
+    cookie_value = normalized_cookie_header or f"sp_dc={normalized_sp_dc}"
+
+    response = requests.get(
         "https://open.spotify.com/api/token",
         headers={
             "User-Agent": UA,
-            "Cookie": f"sp_dc={sp_dc}",
+            "Cookie": cookie_value,
             "Accept": "application/json",
         },
         timeout=10,
     )
-    if r.status_code != 200:
-        raise ValueError(f"sp_dc inválido ou expirado (HTTP {r.status_code})")
+    if response.status_code == 400:
+        response_excerpt = ""
+        try:
+            payload = response.json()
+            response_excerpt = _as_clean_text(
+                payload.get("error_description")
+                or payload.get("error")
+                or payload.get("message")
+            )
+        except Exception:
+            response_excerpt = _as_clean_text(response.text)
 
-    data = r.json()
+        message = (
+            "O Spotify recusou o cookie informado (HTTP 400). "
+            "Isso pode acontecer mesmo com o valor certo, porque esse metodo manual depende "
+            "de cookies internos do Spotify."
+        )
+        if "totp" in response_excerpt.lower():
+            message += " O retorno do Spotify menciona TOTP/validacao interna."
+        message += (
+            " Tente copiar novamente do Spotify Web logado e, se continuar falhando, "
+            "cole o cabecalho Cookie completo da requisicao do navegador em vez de so o sp_dc."
+        )
+        raise ValueError(message)
+
+    if response.status_code != 200:
+        raise ValueError(f"sp_dc invalido ou expirado (HTTP {response.status_code})")
+
+    data = response.json()
     token = data.get("accessToken")
     expires = data.get("accessTokenExpirationTimestampMs", 0) / 1000
 
     if not token:
-        raise ValueError("Não foi possível obter token do Spotify. Verifique o sp_dc.")
+        raise ValueError("Nao foi possivel obter token do Spotify. Verifique o sp_dc.")
 
     _token_cache["token"] = token
     _token_cache["expires"] = expires if expires > time.time() else time.time() + 3600
+    _token_cache["key"] = cache_key
     return token
 
 
-def validate(sp_dc: str) -> dict:
-    """Valida credenciais do Spotify. Retorna info do usuário."""
-    if not sp_dc:
-        raise ValueError("Cookie sp_dc não fornecido.")
-    token = get_token_via_sp_dc(sp_dc)
+def validate(sp_dc: str = None, cookie_header: str = None) -> dict:
+    """Validate Spotify credentials and return basic user info."""
+    normalized_sp_dc = sp_dc or _extract_sp_dc(cookie_header)
+    if not normalized_sp_dc:
+        raise ValueError("Cookie sp_dc nao fornecido.")
 
-    r = requests.get(
+    token = get_token_via_sp_dc(sp_dc=normalized_sp_dc, cookie_header=cookie_header)
+    response = requests.get(
         "https://api.spotify.com/v1/me",
         headers={"Authorization": f"Bearer {token}", "User-Agent": UA},
         timeout=10,
     )
-    if r.status_code == 200:
-        data = r.json()
+    if response.status_code == 200:
+        data = response.json()
         return {
-            "display_name": data.get("display_name", "Usuário Spotify"),
+            "display_name": data.get("display_name", "Usuario Spotify"),
             "email": data.get("email", ""),
             "avatar": (data.get("images") or [{}])[0].get("url", ""),
         }
-    # Token válido mas sem permissão para /me — ainda funciona para leitura pública
-    return {"display_name": "Usuário Spotify", "email": "", "avatar": ""}
+
+    return {"display_name": "Usuario Spotify", "email": "", "avatar": ""}
 
 
-def _extract_id_and_type(url: str) -> tuple[str, str]:
-    """Extrai (tipo, id) de uma URL do Spotify."""
-    for tipo in ["playlist", "album", "track"]:
-        m = re.search(rf"{tipo}/([A-Za-z0-9]+)", url)
-        if m:
-            return tipo, m.group(1)
+def _extract_id_and_type(url: str) -> tuple[str | None, str | None]:
+    for media_type in ["playlist", "album", "track"]:
+        match = re.search(rf"{media_type}/([A-Za-z0-9]+)", url)
+        if match:
+            return media_type, match.group(1)
     return None, None
 
 
-def _read_via_token(tipo: str, pid: str, access_token: str) -> tuple[str, list[dict]]:
-    """Lê playlist/álbum usando access_token OAuth direto."""
+def _parse_embed_payload(html: str) -> dict:
+    match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html)
+    if not match:
+        return {}
+    try:
+        return json.loads(match.group(1))
+    except Exception:
+        return {}
+
+
+def _read_via_token(media_type: str, playlist_id: str, access_token: str) -> tuple[str, list[dict]]:
     headers = {"Authorization": f"Bearer {access_token}", "User-Agent": UA}
-    endpoint = "playlists" if tipo == "playlist" else "albums"
+    endpoint = "playlists" if media_type == "playlist" else "albums"
 
-    r = requests.get(f"https://api.spotify.com/v1/{endpoint}/{pid}", headers=headers, timeout=10)
-    if r.status_code == 401:
-        raise ValueError("Sessão do Spotify expirada. Conecte novamente.")
-    if r.status_code == 404:
-        raise ValueError("Playlist não encontrada. Verifique se é pública ou se você tem acesso.")
-    if r.status_code != 200:
-        raise ValueError(f"Erro do Spotify (HTTP {r.status_code})")
+    response = requests.get(
+        f"https://api.spotify.com/v1/{endpoint}/{playlist_id}",
+        headers=headers,
+        timeout=10,
+    )
+    if response.status_code == 401:
+        raise ValueError("Sessao do Spotify expirada. Conecte novamente.")
+    if response.status_code == 404:
+        raise ValueError("Playlist nao encontrada. Verifique se ela esta publica ou se voce tem acesso.")
+    if response.status_code != 200:
+        raise ValueError(f"Erro do Spotify (HTTP {response.status_code})")
 
-    info = r.json()
-    nome_playlist = info.get("name", "Spotify Playlist")
-    faixas = []
+    info = response.json()
+    playlist_name = info.get("name", "Spotify Playlist")
+    tracks: list[dict] = []
     offset = 0
 
     while True:
-        r2 = requests.get(f"https://api.spotify.com/v1/{endpoint}/{pid}/tracks",
-                          headers=headers,
-                          params={"limit": 100, "offset": offset,
-                                  "fields": "items(track(name,artists(name),album(name))),next"},
-                          timeout=15)
-        if r2.status_code != 200:
+        page_response = requests.get(
+            f"https://api.spotify.com/v1/{endpoint}/{playlist_id}/tracks",
+            headers=headers,
+            params={
+                "limit": 100,
+                "offset": offset,
+                "fields": "items(track(name,artists(name),album(name))),next",
+            },
+            timeout=15,
+        )
+        if page_response.status_code != 200:
             break
-        data = r2.json()
-        items = data.get("items", [])
+
+        page = page_response.json()
+        items = page.get("items", [])
         for item in items:
-            t = item.get("track") or item
-            if not t or not t.get("name"):
+            track = item.get("track") or item
+            if not track or not track.get("name"):
                 continue
-            faixas.append({
-                "titulo":  t["name"],
-                "artista": ", ".join(a["name"] for a in t.get("artists", [])),
-                "album":   t.get("album", {}).get("name", "") if isinstance(t.get("album"), dict) else "",
-            })
+            tracks.append(
+                {
+                    "titulo": track["name"],
+                    "artista": ", ".join(artist["name"] for artist in track.get("artists", [])),
+                    "album": track.get("album", {}).get("name", "")
+                    if isinstance(track.get("album"), dict)
+                    else "",
+                }
+            )
+
         offset += len(items)
-        if not data.get("next"):
+        if not page.get("next"):
             break
 
-    return nome_playlist, faixas
+    return playlist_name, tracks
 
 
-def read_playlist(url: str, sp_dc: str = None, access_token: str = None) -> tuple[str, list[dict]]:
-    """
-    Lê músicas de uma playlist/álbum do Spotify.
-    Aceita access_token (OAuth) ou sp_dc (cookie).
-    """
-    tipo, pid = _extract_id_and_type(url)
-    if not pid:
-        raise ValueError("URL do Spotify inválida. Use: https://open.spotify.com/playlist/...")
+def read_playlist(
+    url: str,
+    sp_dc: str = None,
+    access_token: str = None,
+    cookie_header: str = None,
+) -> tuple[str, list[dict]]:
+    """Read Spotify playlist or album through OAuth, public embed, or cookie."""
+    media_type, playlist_id = _extract_id_and_type(url)
+    if not playlist_id:
+        raise ValueError("URL do Spotify invalida. Use: https://open.spotify.com/playlist/...")
 
-    # ── Se temos access_token OAuth, usa diretamente ───────────────────────
     if access_token:
-        return _read_via_token(tipo, pid, access_token)
+        return _read_via_token(media_type, playlist_id, access_token)
 
-    faixas = []
-    nome_playlist = "Spotify Playlist"
+    tracks: list[dict] = []
+    playlist_name = "Spotify Playlist"
+    embed_status = None
+    embed_page_title = ""
+    share_token_link = "pt=" in (url or "")
 
-    # ── Tentativa 1: Embed público (sem auth) ──────────────────────────────
     try:
-        embed_url = f"https://open.spotify.com/embed/{tipo}/{pid}"
-        r = requests.get(embed_url, headers={"User-Agent": UA}, timeout=10)
-        if r.status_code == 200:
-            m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', r.text)
-            if m:
-                data = json.loads(m.group(1))
-                entity = (data.get("props", {})
-                              .get("pageProps", {})
-                              .get("state", {})
-                              .get("data", {})
-                              .get("entity", {}))
+        embed_response = requests.get(
+            f"https://open.spotify.com/embed/{media_type}/{playlist_id}",
+            headers={"User-Agent": UA},
+            timeout=10,
+        )
+        if embed_response.status_code == 200:
+            data = _parse_embed_payload(embed_response.text)
+            if data:
+                page_props = data.get("props", {}).get("pageProps", {})
+                embed_status = page_props.get("status")
+                embed_page_title = _as_clean_text(page_props.get("title"))
+                entity = (
+                    page_props.get("state", {})
+                    .get("data", {})
+                    .get("entity", {})
+                )
                 tracks_data = entity.get("trackList", [])
-                nome_playlist = entity.get("name", "Spotify Playlist")
-                for t in tracks_data:
-                    artista = t.get("subtitle", "")
-                    titulo = t.get("title", "")
-                    if titulo:
-                        faixas.append({"titulo": titulo, "artista": artista, "album": ""})
+                playlist_name = entity.get("name", "Spotify Playlist")
 
-                # Para álbuns ou playlists curtas, o embed é suficiente
-                if faixas and (tipo == "album" or len(faixas) < 50):
-                    return nome_playlist, faixas
-    except Exception as e:
-        print(f"[Spotify] Embed falhou: {e}")
+                for track in tracks_data:
+                    title = _as_clean_text(track.get("title"))
+                    artist = _as_clean_text(track.get("subtitle"))
+                    if title:
+                        tracks.append({"titulo": title, "artista": artist, "album": ""})
 
-    # ── Tentativa 2: API Oficial com sp_dc ────────────────────────────────
-    _sp_dc = sp_dc or _get_sp_dc()
-    if not _sp_dc:
-        if faixas:
-            return nome_playlist, faixas
+                if tracks and (media_type == "album" or len(tracks) < 50):
+                    return playlist_name, tracks
+    except Exception as exc:
+        print(f"[Spotify] Embed falhou: {exc}")
+
+    normalized_sp_dc = sp_dc or _extract_sp_dc(cookie_header) or _get_sp_dc()
+    if not normalized_sp_dc and not cookie_header:
+        if embed_status == 404 or "page not found" in embed_page_title.lower():
+            if share_token_link:
+                raise ValueError(
+                    "Esse link do Spotify nao esta publico. "
+                    "Sem entrar no Spotify, o app nao consegue abrir essa playlist."
+                )
+            raise ValueError(
+                "Essa playlist do Spotify nao esta publica. "
+                "Sem entrar no Spotify, o app nao consegue ler essa playlist."
+            )
+        if tracks:
+            return playlist_name, tracks
         raise ValueError(
-            "Playlist pode ter mais de 50 músicas. Forneça o cookie sp_dc para ler a playlist completa."
+            "Playlist pode ter mais de 50 musicas. Forneca o cookie sp_dc para ler a playlist completa."
         )
 
-    token = get_token_via_sp_dc(_sp_dc)
+    token = get_token_via_sp_dc(sp_dc=normalized_sp_dc, cookie_header=cookie_header)
     headers = {"Authorization": f"Bearer {token}", "User-Agent": UA}
+    endpoint = "playlists" if media_type == "playlist" else "albums"
 
-    endpoint = "playlists" if tipo == "playlist" else "albums"
-    r = requests.get(f"https://api.spotify.com/v1/{endpoint}/{pid}", headers=headers, timeout=10)
-
-    if r.status_code == 401:
+    info_response = requests.get(
+        f"https://api.spotify.com/v1/{endpoint}/{playlist_id}",
+        headers=headers,
+        timeout=10,
+    )
+    if info_response.status_code == 401:
         _token_cache["token"] = None
         raise ValueError("Token do Spotify expirou. Reconecte o Spotify.")
-    if r.status_code == 404:
-        raise ValueError("Playlist não encontrada. Verifique se é pública.")
-    if r.status_code != 200:
-        raise ValueError(f"Erro do Spotify (HTTP {r.status_code})")
+    if info_response.status_code == 404:
+        raise ValueError("Playlist nao encontrada. Verifique se ela esta publica.")
+    if info_response.status_code != 200:
+        raise ValueError(f"Erro do Spotify (HTTP {info_response.status_code})")
 
-    info = r.json()
-    nome_playlist = info.get("name", "Spotify Playlist")
-    faixas = []
+    info = info_response.json()
+    playlist_name = info.get("name", "Spotify Playlist")
+    tracks = []
     offset = 0
 
-    tracks_key = "tracks" if tipo == "playlist" else "tracks"
     while True:
-        track_url = f"https://api.spotify.com/v1/{endpoint}/{pid}/tracks"
-        params = {"limit": 100, "offset": offset,
-                  "fields": "items(track(name,artists(name),album(name))),next"}
-        r2 = requests.get(track_url, headers=headers, params=params, timeout=15)
-        if r2.status_code != 200:
-            break
-        data = r2.json()
-        items = data.get("items", [])
-        for item in items:
-            t = item.get("track") or item
-            if not t or not t.get("name"):
-                continue
-            faixas.append({
-                "titulo": t["name"],
-                "artista": ", ".join(a["name"] for a in t.get("artists", [])),
-                "album": t.get("album", {}).get("name", "") if isinstance(t.get("album"), dict) else "",
-            })
-        offset += len(items)
-        if not data.get("next"):
+        page_response = requests.get(
+            f"https://api.spotify.com/v1/{endpoint}/{playlist_id}/tracks",
+            headers=headers,
+            params={
+                "limit": 100,
+                "offset": offset,
+                "fields": "items(track(name,artists(name),album(name))),next",
+            },
+            timeout=15,
+        )
+        if page_response.status_code != 200:
             break
 
-    return nome_playlist, faixas
+        page = page_response.json()
+        items = page.get("items", [])
+        for item in items:
+            track = item.get("track") or item
+            if not track or not track.get("name"):
+                continue
+            tracks.append(
+                {
+                    "titulo": track["name"],
+                    "artista": ", ".join(artist["name"] for artist in track.get("artists", [])),
+                    "album": track.get("album", {}).get("name", "")
+                    if isinstance(track.get("album"), dict)
+                    else "",
+                }
+            )
+
+        offset += len(items)
+        if not page.get("next"):
+            break
+
+    return playlist_name, tracks
+
+
+def search_track(access_token: str, titulo: str, artista: str = "", album: str = "") -> str | None:
+    """Search a track on Spotify and return its best-matching URI."""
+    if not access_token:
+        raise ValueError("Access token do Spotify nao informado.")
+
+    queries = []
+    if artista and album:
+        queries.append(f'track:"{titulo}" artist:"{artista}" album:"{album}"')
+    if artista:
+        queries.append(f'track:"{titulo}" artist:"{artista}"')
+        queries.append(f"{artista} {titulo}")
+    queries.append(titulo)
+
+    headers = {"Authorization": f"Bearer {access_token}", "User-Agent": UA}
+
+    for query in queries:
+        try:
+            response = requests.get(
+                "https://api.spotify.com/v1/search",
+                headers=headers,
+                params={"q": query, "type": "track", "limit": 5},
+                timeout=10,
+            )
+            if response.status_code != 200:
+                continue
+            items = response.json().get("tracks", {}).get("items", [])
+            if items:
+                return items[0].get("uri")
+        except Exception:
+            continue
+
+    return None
+
+
+def create_playlist(access_token: str, nome: str, descricao: str = "") -> str:
+    """Create a private playlist on Spotify and return its id."""
+    if not access_token:
+        raise ValueError("Access token do Spotify nao informado.")
+
+    response = requests.post(
+        "https://api.spotify.com/v1/me/playlists",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": UA,
+            "Content-Type": "application/json",
+        },
+        json={
+            "name": nome,
+            "description": descricao or "Transferida via PlayTransfer",
+            "public": False,
+        },
+        timeout=15,
+    )
+
+    if response.status_code not in (200, 201):
+        raise ValueError(f"Nao foi possivel criar playlist no Spotify (HTTP {response.status_code}).")
+
+    playlist_id = response.json().get("id")
+    if not playlist_id:
+        raise ValueError("Spotify nao retornou o ID da playlist criada.")
+    return playlist_id
+
+
+def add_tracks(access_token: str, playlist_id: str, track_uris: list[str]) -> None:
+    """Add track URIs to a Spotify playlist in batches."""
+    if not access_token:
+        raise ValueError("Access token do Spotify nao informado.")
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "User-Agent": UA,
+        "Content-Type": "application/json",
+    }
+
+    for index in range(0, len(track_uris), 100):
+        chunk = track_uris[index : index + 100]
+        response = requests.post(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
+            headers=headers,
+            json={"uris": chunk},
+            timeout=15,
+        )
+        if response.status_code not in (200, 201):
+            raise ValueError(f"Erro ao adicionar faixas no Spotify (HTTP {response.status_code}).")
