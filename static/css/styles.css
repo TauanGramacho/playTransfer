@@ -632,8 +632,8 @@ nav {
 
 .manual-connect-panel {
   display: grid;
-  gap: 14px;
-  padding-top: 16px;
+  gap: 12px;
+  padding-top: 12px;
 }
 .manual-connect-platform {
   display: flex;
@@ -660,6 +660,23 @@ nav {
   gap: 10px;
   flex-wrap: wrap;
   align-items: center;
+}
+.deezer-quick-header {
+  gap: 0;
+}
+.deezer-quick-actions {
+  margin-top: -4px;
+}
+.deezer-quick-hint {
+  font-size: 0.78rem;
+  line-height: 1.55;
+  color: var(--color-muted);
+}
+.compact-manual-details {
+  margin-top: 2px;
+}
+.compact-manual-details .advanced-details-body {
+  padding-top: 12px;
 }
 .manual-connect-badges {
   display: flex;

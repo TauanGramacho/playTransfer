@@ -2,7 +2,7 @@
 app.py — PlayTransfer
 Servidor Flask principal — OAuth + API REST + worker threads
 """
-import base64, hashlib, json, os, subprocess, time, threading, traceback, secrets, urllib.parse
+import base64, hashlib, json, os, subprocess, tempfile, time, threading, traceback, secrets, urllib.parse
 import requests as req_lib
 from flask import Flask, render_template, request, jsonify, redirect, session, abort
 from dotenv import load_dotenv
@@ -447,53 +447,63 @@ def _run_deezer_chrome_guided_capture(role: str):
         "updated_at": time.time(),
     })
 
-    base = (BASE_URL or "http://127.0.0.1:5001").rstrip("/")
-    capture_base = f"{base}/api/connect/deezer/browser-guided/capture?role={urllib.parse.quote(role)}&t="
-    js = (
-        "javascript:(function(){try{"
-        "var m=document.cookie.match(/(?:^|;\\\\s*)arl=([^;]+)/);"
-        "var arl=m?decodeURIComponent(m[1]):'';"
-        f"(new Image()).src={json.dumps(capture_base)}+Date.now()+(arl?'&arl='+encodeURIComponent(arl):'&error=missing_arl');"
-        "}catch(e){"
-        f"(new Image()).src={json.dumps(capture_base)}+Date.now()+'&error='+encodeURIComponent(String((e&&e.message)||e||'capture_failed'));"
-        "}})();"
-    )
+    console_command = "copy((document.cookie.match(/(?:^|;\\s*)arl=([^;]+)/)||[])[1]||'')"
+    js_b64 = base64.b64encode(console_command.encode("utf-8")).decode("ascii")
 
     ps_script = f"""
 $ErrorActionPreference = 'Stop'
 $wshell = New-Object -ComObject WScript.Shell
-$focused = $wshell.AppActivate('PlayTransfer')
-if (-not $focused) {{ $focused = $wshell.AppActivate('Chrome') }}
-if (-not $focused) {{ throw 'chrome_window_not_found' }}
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public static class WinApi {{
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+}}
+"@
+$foreground = [WinApi]::GetForegroundWindow()
+if ($foreground -eq [IntPtr]::Zero) {{ throw 'chrome_window_not_found' }}
+[WinApi]::ShowWindowAsync($foreground, 9) | Out-Null
+Start-Sleep -Milliseconds 120
+[WinApi]::SetForegroundWindow($foreground) | Out-Null
+$browserPid = [uint32]0
+[WinApi]::GetWindowThreadProcessId($foreground, [ref]$browserPid) | Out-Null
+if ($browserPid -eq 0) {{ throw 'chrome_window_not_found' }}
+$null = $wshell.AppActivate([int]$browserPid)
 Start-Sleep -Milliseconds 250
-Set-Clipboard -Value 'https://www.deezer.com/'
-$wshell.SendKeys('^l')
-Start-Sleep -Milliseconds 120
+$consoleCommand = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{js_b64}'))
+Set-Clipboard -Value $consoleCommand
+$wshell.SendKeys('^+j')
+Start-Sleep -Milliseconds 900
 $wshell.SendKeys('^v')
-Start-Sleep -Milliseconds 120
-$wshell.SendKeys('%{{ENTER}}')
-Start-Sleep -Milliseconds 1800
-Set-Clipboard -Value {json.dumps(js)}
-$wshell.SendKeys('^l')
-Start-Sleep -Milliseconds 120
-$wshell.SendKeys('^v')
-Start-Sleep -Milliseconds 120
+Start-Sleep -Milliseconds 140
 $wshell.SendKeys('{{ENTER}}')
 Start-Sleep -Milliseconds 900
-$wshell.SendKeys('^+a')
-Start-Sleep -Milliseconds 250
-Set-Clipboard -Value 'PlayTransfer'
-$wshell.SendKeys('^v')
-Start-Sleep -Milliseconds 200
-$wshell.SendKeys('{{ENTER}}')
+$capturedArl = ''
+try {{
+  $capturedArl = (Get-Clipboard -Raw).Trim()
+}} catch {{
+  $capturedArl = ''
+}}
+$wshell.SendKeys('{{F12}}')
+Start-Sleep -Milliseconds 350
+if (-not $capturedArl) {{
+  throw 'missing_arl'
+}}
+Write-Output $capturedArl
 """
 
     attempt["step"] = "running_chrome"
     attempt["updated_at"] = time.time()
 
     try:
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_script],
+        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".ps1", encoding="utf-8") as fh:
+            fh.write(ps_script)
+            script_path = fh.name
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path],
             check=True,
             capture_output=True,
             text=True,
@@ -507,6 +517,17 @@ $wshell.SendKeys('{{ENTER}}')
             "updated_at": time.time(),
         })
         return
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        stdout = (exc.stdout or "").strip()
+        detail = stderr or stdout or str(exc)
+        attempt.update({
+            "status": "error",
+            "error": f"Nao consegui automatizar o Chrome agora: {detail}",
+            "step": "automation_failed",
+            "updated_at": time.time(),
+        })
+        return
     except Exception as exc:
         attempt.update({
             "status": "error",
@@ -515,19 +536,27 @@ $wshell.SendKeys('{{ENTER}}')
             "updated_at": time.time(),
         })
         return
+    finally:
+        try:
+            if 'script_path' in locals() and os.path.exists(script_path):
+                os.remove(script_path)
+        except Exception:
+            pass
 
-    attempt["step"] = "waiting_capture"
-    attempt["updated_at"] = time.time()
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        current = deezer_browser_guided.get(role, {})
-        if current.get("status") in {"captured", "error"}:
-            return
-        time.sleep(0.4)
+    captured_arl = (completed.stdout or "").strip()
+    if captured_arl and len(captured_arl) > 20:
+        attempt.update({
+            "status": "captured",
+            "error": "",
+            "arl": captured_arl,
+            "step": "captured",
+            "updated_at": time.time(),
+        })
+        return
 
     attempt.update({
         "status": "error",
-        "error": "Nao consegui confirmar a captura automatica no Chrome.",
+        "error": "missing_arl",
         "step": "no_capture",
         "updated_at": time.time(),
     })
