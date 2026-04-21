@@ -667,6 +667,26 @@ nav {
 .deezer-quick-actions {
   margin-top: -4px;
 }
+.deezer-quick-actions .deezer-auto-connect-btn {
+  width: 100%;
+  padding: 12px 20px;
+  font-size: 0.88rem;
+  border-radius: 14px;
+  background: linear-gradient(135deg, #A238FF, #7C3AED);
+  color: #fff;
+  font-weight: 700;
+  box-shadow: 0 4px 16px rgba(162,56,255,0.25);
+  transition: all 0.3s ease;
+}
+.deezer-quick-actions .deezer-auto-connect-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 22px rgba(162,56,255,0.35);
+  filter: brightness(1.1);
+}
+.deezer-quick-actions .deezer-auto-connect-btn:disabled {
+  opacity: 0.8;
+  cursor: wait;
+}
 .deezer-quick-hint {
   font-size: 0.78rem;
   line-height: 1.55;

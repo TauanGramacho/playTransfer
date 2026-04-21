@@ -447,8 +447,8 @@ def _run_deezer_chrome_guided_capture(role: str):
         "updated_at": time.time(),
     })
 
-    console_command = "copy((document.cookie.match(/(?:^|;\\s*)arl=([^;]+)/)||[])[1]||'')"
-    js_b64 = base64.b64encode(console_command.encode("utf-8")).decode("ascii")
+    js_payload = "(function(){var a=(document.cookie.match(/(?:^|;\\s*)arl=([^;]+)/)||['',''])[1];prompt('PLAYTRANSFER', a);})();void(0);"
+    js_b64 = base64.b64encode(js_payload.encode("utf-8")).decode("ascii")
 
     ps_script = f"""
 $ErrorActionPreference = 'Stop'
@@ -472,24 +472,45 @@ $browserPid = [uint32]0
 [WinApi]::GetWindowThreadProcessId($foreground, [ref]$browserPid) | Out-Null
 if ($browserPid -eq 0) {{ throw 'chrome_window_not_found' }}
 $null = $wshell.AppActivate([int]$browserPid)
-Start-Sleep -Milliseconds 250
+Start-Sleep -Milliseconds 300
+
+$wshell.SendKeys('{{ESC}}')
+Start-Sleep -Milliseconds 80
+
+Set-Clipboard -Value ''
 $consoleCommand = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{js_b64}'))
 Set-Clipboard -Value $consoleCommand
-$wshell.SendKeys('^+j')
-Start-Sleep -Milliseconds 900
+
+$wshell.SendKeys('{{F6}}')
+Start-Sleep -Milliseconds 150
+$wshell.SendKeys('^l')
+Start-Sleep -Milliseconds 150
+$wshell.SendKeys('javascript:')
+Start-Sleep -Milliseconds 80
 $wshell.SendKeys('^v')
-Start-Sleep -Milliseconds 140
+Start-Sleep -Milliseconds 150
 $wshell.SendKeys('{{ENTER}}')
-Start-Sleep -Milliseconds 900
+Start-Sleep -Milliseconds 1200
+
+Set-Clipboard -Value ''
+$wshell.SendKeys('^a')
+Start-Sleep -Milliseconds 80
+$wshell.SendKeys('^c')
+Start-Sleep -Milliseconds 250
+$wshell.SendKeys('{{ESC}}')
+Start-Sleep -Milliseconds 150
+
 $capturedArl = ''
 try {{
   $capturedArl = (Get-Clipboard -Raw).Trim()
 }} catch {{
   $capturedArl = ''
 }}
-$wshell.SendKeys('{{F12}}')
-Start-Sleep -Milliseconds 350
+
 if (-not $capturedArl) {{
+  throw 'missing_arl'
+}}
+if ($capturedArl.Contains('document.cookie') -or $capturedArl.StartsWith('javascript:')) {{
   throw 'missing_arl'
 }}
 Write-Output $capturedArl

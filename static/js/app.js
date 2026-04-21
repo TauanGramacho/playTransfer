@@ -900,6 +900,7 @@ function newTransfer() {
   });
   state.deezerTabsOpened = {};
   state.deezerCapturePolls = {};
+  state.deezerAutoConnecting = {};
   state.jobId = null; state.eventIdx = 0;
   if (state.pollTimer) clearInterval(state.pollTimer);
   document.getElementById('playlist-url').value = '';
@@ -1638,62 +1639,62 @@ function makeDeezerForm(role) {
   }
 
   const wrapper = document.createElement('div');
+
+  // Se OAuth está configurado, oferece OAuth primeiro + fallback manual
   if (state.platforms.deezer?.oauth_configured) {
     wrapper.appendChild(makeOAuthForm('deezer', role));
     wrapper.appendChild(makeAdvancedDetails(
-      'Usar modo manual do Deezer',
-      makeManualCredentialsForm({
-        platform: 'deezer',
-        role,
-        title: 'Modo manual do Deezer',
-        subtitle: 'Use isso apenas se o login oficial nao abrir e voce realmente precisar continuar agora.',
-        label: 'Cole aqui o valor do cookie arl',
-        inputId: `${role}-deezer-cookie`,
-        placeholder: 'Cole somente o valor do cookie arl',
-        statusId: `${role}-deezer-status`,
-        action: 'connectDeezer',
-        buttonLabel: 'Conectar Deezer',
-        help: 'Nao precisa incluir "arl=" nem mexer no .env. So copie e cole o valor.',
-        steps: [
-          {
-            title: 'Abra o Deezer',
-            detail: 'Entre na conta certa e deixe a pagina aberta.',
-          },
-          {
-            title: 'Copie o arl',
-            detail: 'Pressione <kbd>F12</kbd>, abra <strong>Application</strong> ou <strong>Armazenamento</strong>, depois <strong>Cookies</strong> e escolha <code>https://www.deezer.com</code>.',
-            hint: 'Clique no cookie <code>arl</code> e copie apenas o valor dele.',
-          },
-        ],
-      })
+      'Usar modo automatico do Deezer',
+      makeDeezerQuickConnect(role)
     ));
     return wrapper;
   }
 
+  // Sem OAuth: fluxo automatico é o principal
   wrapper.appendChild(makeDeezerQuickConnect(role));
   return wrapper;
 }
 
 function makeDeezerQuickConnect(role) {
+  const connected = (role === 'src' && state.srcSid) || (role === 'dest' && state.destSid);
+  const displayName = role === 'src' ? state.srcDisplayName : state.destDisplayName;
+
+  if (connected && displayName) {
+    return makeConnectCallout({
+      platform: 'deezer',
+      tone: 'success',
+      badge: 'Conectado',
+      title: `Deezer conectado como ${displayName}`,
+      subtitle: 'Pronto para transferir playlists.',
+    });
+  }
+
   const opened = !!state.deezerTabsOpened?.[role];
+  const autoTrying = !!state.deezerAutoConnecting?.[role];
+
   return makeFormPanel(`
     <div class="manual-connect-header deezer-quick-header">
       <div class="manual-connect-platform">
         <div class="manual-connect-platform-icon">${PLATFORM_ICONS.deezer || ''}</div>
         <div class="manual-connect-platform-copy">
           <div class="manual-connect-title">Conectar Deezer</div>
-          <div class="manual-connect-subtitle">Abra o Deezer, faca login se precisar e volte aqui para o app tentar buscar o <code>arl</code> sozinho.</div>
+          <div class="manual-connect-subtitle">Clique no botao abaixo. O app tenta encontrar seu login do Deezer automaticamente.</div>
         </div>
       </div>
     </div>
     <div class="manual-connect-actions deezer-quick-actions">
-      <button class="btn btn-ghost btn-sm" type="button" onclick="openDeezerTab('${role}')">Abrir Deezer</button>
-      <button class="btn btn-secondary btn-sm" type="button" onclick="advanceDeezerGuidedCapture('${role}')">Capturar automaticamente</button>
+      <button class="btn btn-primary btn-sm deezer-auto-connect-btn" type="button" id="${role}-deezer-auto-btn" onclick="autoConnectDeezer('${role}')" ${autoTrying ? 'disabled' : ''}>
+        ${autoTrying ? '<span class="spin-inline"></span> Conectando...' : '🔌 Conectar Deezer automaticamente'}
+      </button>
     </div>
-    <div class="deezer-quick-hint">${opened ? 'O Deezer ja foi aberto por aqui. Se voce ja entrou na conta, toque em "Capturar automaticamente".' : 'Primeiro toque em "Abrir Deezer". Depois volte para esta tela e toque em "Capturar automaticamente".'}</div>
+    <div class="deezer-quick-hint" id="${role}-deezer-hint">
+      ${opened
+        ? 'O Deezer ja esta aberto. Se voce ja entrou na conta, basta clicar no botao acima.'
+        : 'Se o Deezer ja estiver aberto e logado neste navegador, o app consegue capturar o login sozinho.'}
+    </div>
     ${makeInlineStatus(`${role}-deezer-status`)}
     <details class="advanced-details compact-manual-details">
-      <summary>Fazer manualmente</summary>
+      <summary>Nao funcionou? Fazer manualmente</summary>
       <div class="advanced-details-body">
         <div class="form-group" style="margin-top:0;">
           <label class="form-label" for="${role}-deezer-cookie">Cole aqui o valor do cookie arl</label>
@@ -2124,7 +2125,11 @@ function getPlatformCardAvailability(key, platform, role) {
     return { visible: true, disabled: false, badge: '', meta: '' };
   }
 
-  if (key === 'spotify' || key === 'deezer') {
+  if (key === 'deezer') {
+    return { visible: true, disabled: false, badge: '', meta: '' };
+  }
+
+  if (key === 'spotify') {
     return platform?.oauth_configured
       ? { visible: true, disabled: false, badge: '', meta: '' }
       : { visible: true, disabled: true, badge: 'Configurar', meta: 'Falta login oficial do site' };
@@ -2354,15 +2359,17 @@ async function connectDeezer(role) {
       showToast('Deezer conectado!', 'success');
       renderConnectForms();
       checkTransferReady();
-      return;
+      return true;
     }
 
     const message = humanizePlatformError(d.error || 'Falha ao conectar Deezer');
     if (status) status.textContent = message;
     showToast(message, 'error');
+    return false;
   } catch {
     if (status) status.textContent = 'Erro de rede.';
     showToast('Erro ao conectar Deezer', 'error');
+    return false;
   }
 }
 
@@ -2411,15 +2418,22 @@ async function readDeezerCookieFromBrowser(role) {
 
 function advanceDeezerGuidedCapture(role) {
   const status = document.getElementById(`${role}-deezer-status`);
+
+  // Se o Deezer não foi aberto ainda, abre automaticamente antes de capturar
   if (!state.deezerTabsOpened?.[role]) {
     if (status) {
-      status.textContent = 'Abra o Deezer primeiro. Depois volte aqui e toque em "Capturar automaticamente".';
+      status.innerHTML = '<span class="spin-inline"></span> Abrindo o Deezer...';
     }
+    openDeezerTab(role);
+    // Espera o Deezer carregar antes de tentar capturar
+    setTimeout(() => {
+      advanceDeezerGuidedCapture(role);
+    }, 3000);
     return;
   }
 
   if (status) {
-    status.innerHTML = '<span class="spin-inline"></span> Tentando buscar o login do Deezer na aba que voce abriu...';
+    status.innerHTML = '<span class="spin-inline"></span> Buscando o login do Deezer...';
   }
   const deezerTab = deezerTabRefs[role];
   if (deezerTab && !deezerTab.closed) {
@@ -2437,6 +2451,16 @@ function advanceDeezerGuidedCapture(role) {
 }
 
 function openDeezerTab(role) {
+  // Verifica se já existe uma aba do Deezer aberta por nós
+  const existingTab = deezerTabRefs[role];
+  if (existingTab && !existingTab.closed) {
+    try {
+      existingTab.focus();
+    } catch {}
+    state.deezerTabsOpened[role] = true;
+    return existingTab;
+  }
+
   const deezerTab = window.open('https://www.deezer.com/', '_blank');
 
   if (!deezerTab) {
@@ -2444,16 +2468,15 @@ function openDeezerTab(role) {
     if (status) {
       status.textContent = 'O navegador bloqueou a aba do Deezer. Libere pop-ups para este site e tente de novo.';
     }
-    return;
+    return null;
   }
 
   deezerTabRefs[role] = deezerTab;
   state.deezerTabsOpened[role] = true;
-  renderConnectForms();
 
   const status = document.getElementById(`${role}-deezer-status`);
   if (status) {
-    status.textContent = 'Deezer aberto. Se ele pedir login, entre na conta e volte aqui para tocar em "Capturar automaticamente".';
+    status.innerHTML = '<span class="spin-inline"></span> Deezer aberto. Aguardando carregamento...';
   }
 
   setTimeout(() => {
@@ -2462,6 +2485,185 @@ function openDeezerTab(role) {
       window.focus();
     } catch {}
   }, 150);
+
+  return deezerTab;
+}
+
+/**
+ * autoConnectDeezer — Fluxo unificado de conexão automática do Deezer.
+ * 1. Tenta ler ARL dos cookies salvos no navegador (browser_cookie3)
+ * 2. Se falhar, abre o Deezer em nova aba e tenta automação via Chrome DevTools
+ * 3. Se tudo falhar, orienta o usuário pelo modo manual
+ */
+async function autoConnectDeezer(role) {
+  const status = document.getElementById(`${role}-deezer-status`);
+  const btn = document.getElementById(`${role}-deezer-auto-btn`);
+  const hint = document.getElementById(`${role}-deezer-hint`);
+
+  state.deezerAutoConnecting = state.deezerAutoConnecting || {};
+  state.deezerAutoConnecting[role] = true;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin-inline"></span> Conectando...';
+  }
+
+  if (status) {
+    status.innerHTML = '<span class="spin-inline"></span> Tentando encontrar o login do Deezer nos seus navegadores...';
+  }
+
+  // Etapa 1: Tentar ler cookie ARL direto dos navegadores da máquina
+  try {
+    const r = await fetch('/api/connect/deezer/browser-cookie', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ role }),
+    });
+    const d = await r.json();
+
+    if (d.ok && d.arl) {
+      if (status) {
+        status.innerHTML = `<span class="spin-inline"></span> Login encontrado no ${escapeHtml(d.browser || 'navegador')}! Confirmando...`;
+      }
+      const input = document.getElementById(`${role}-deezer-cookie`);
+      if (input) input.value = d.arl;
+
+      try {
+        const success = await connectDeezer(role);
+        if (success) {
+          state.deezerAutoConnecting[role] = false;
+          return; // Sucesso!
+        }
+        // ARL encontrado mas inválido, continua para etapa 2
+      } catch {
+        // Falhou inesperadamente, continua para etapa 2
+      }
+    }
+  } catch {
+    // browser_cookie3 não disponível ou falhou, continua
+  }
+
+  // Etapa 2: Abrir Deezer e tentar automação Chrome
+  if (status) {
+    status.innerHTML = '<span class="spin-inline"></span> Abrindo o Deezer para capturar o login...';
+  }
+  if (hint) {
+    hint.textContent = 'O app esta tentando automaticamente. Nao precisa fazer nada.';
+  }
+
+  // Abre Deezer se ainda não está aberto
+  if (!state.deezerTabsOpened?.[role] || !deezerTabRefs[role] || deezerTabRefs[role]?.closed) {
+    const tab = openDeezerTab(role);
+    if (!tab) {
+      if (status) {
+        status.textContent = 'Nao consegui abrir o Deezer automaticamente. Abra o Deezer manualmente, entre na conta e use o modo manual abaixo.';
+      }
+      resetDeezerAutoBtn(role);
+      return;
+    }
+    // Espera o Deezer carregar
+    await new Promise(resolve => setTimeout(resolve, 3500));
+  }
+
+  // Foca na aba do Deezer para a automação funcionar
+  const deezerTab = deezerTabRefs[role];
+  if (deezerTab && !deezerTab.closed) {
+    try { deezerTab.focus(); } catch {}
+  }
+
+  if (status) {
+    status.innerHTML = '<span class="spin-inline"></span> Capturando o login do Deezer...';
+  }
+
+  // Inicia automação Chrome e monitora resultado
+  try {
+    const r = await fetch('/api/connect/deezer/browser-guided/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ role }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      throw new Error(d.error || 'Falha ao iniciar captura');
+    }
+
+    // Poll para resultado
+    await pollDeezerAutoConnect(role, 0);
+  } catch (error) {
+    const message = humanizePlatformError(error?.message || 'Falha na captura automatica');
+    if (status) {
+      status.textContent = `${message} Use o modo manual abaixo.`;
+    }
+    resetDeezerAutoBtn(role);
+  }
+
+  // Volta o foco para o PlayTransfer
+  setTimeout(() => {
+    try { window.focus(); } catch {}
+  }, 1500);
+}
+
+async function pollDeezerAutoConnect(role, attempt) {
+  const status = document.getElementById(`${role}-deezer-status`);
+  const input = document.getElementById(`${role}-deezer-cookie`);
+
+  try {
+    const r = await fetch(`/api/connect/deezer/browser-guided/status?role=${encodeURIComponent(role)}`);
+    const d = await r.json();
+
+    if (d.status === 'captured' && d.arl) {
+      if (input) input.value = d.arl;
+      if (status) {
+        status.innerHTML = '<span class="spin-inline"></span> Login capturado! Confirmando conexao...';
+      }
+      try { window.focus(); } catch {}
+      const success = await connectDeezer(role);
+      if (success) {
+        state.deezerAutoConnecting[role] = false;
+        return;
+      }
+      
+      resetDeezerAutoBtn(role);
+      return;
+    }
+
+    if (d.status === 'error') {
+      const rawError = String(d.error || '');
+      let message = humanizePlatformError(rawError || 'Falha na captura automatica');
+      if (rawError === 'missing_arl') {
+        message = 'Nao encontrei o login do Deezer. Verifique se voce esta logado no Deezer e tente de novo, ou use o modo manual abaixo.';
+      } else if (rawError.includes('chrome_window_not_found')) {
+        message = 'Nao encontrei a janela do navegador. Tente de novo ou use o modo manual abaixo.';
+      }
+      if (status) status.textContent = message;
+      try { window.focus(); } catch {}
+      resetDeezerAutoBtn(role);
+      return;
+    }
+  } catch {
+    if (status) status.textContent = 'Erro ao acompanhar a captura. Tente de novo ou use o modo manual.';
+    resetDeezerAutoBtn(role);
+    return;
+  }
+
+  if (attempt >= 18) {
+    if (status) status.textContent = 'A captura demorou demais. Tente de novo ou use o modo manual abaixo.';
+    try { window.focus(); } catch {}
+    resetDeezerAutoBtn(role);
+    return;
+  }
+
+  setTimeout(() => pollDeezerAutoConnect(role, attempt + 1), 900);
+}
+
+function resetDeezerAutoBtn(role) {
+  state.deezerAutoConnecting = state.deezerAutoConnecting || {};
+  state.deezerAutoConnecting[role] = false;
+  const btn = document.getElementById(`${role}-deezer-auto-btn`);
+  if (btn) {
+    btn.disabled = false;
+    btn.innerHTML = '🔌 Tentar novamente';
+  }
 }
 
 async function startDeezerChromeAutomation(role) {
