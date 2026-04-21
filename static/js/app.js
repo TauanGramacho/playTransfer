@@ -94,18 +94,6 @@ function handleOAuthRedirectParams() {
 }
 
 // ── OAuth Popup ────────────────────────────────────────────
-function openOAuthPopup(platform, role) {
-  const url = `/auth/${platform}?role=${role}`;
-  const w = 520, h = 640;
-  const left = (screen.width - w) / 2;
-  const top  = (screen.height - h) / 2;
-  const popup = window.open(url, 'oauth_popup',
-    `width=${w},height=${h},left=${left},top=${top},toolbar=no,menubar=no`);
-  if (!popup) {
-    // Popup bloqueado — usa redirect
-    window.location.href = url;
-  }
-}
 
 // ── Scroll ─────────────────────────────────────────────────
 function scrollToApp() {
@@ -156,31 +144,6 @@ function resetPreviewPanel() {
 }
 
 // ── Platform Grids ─────────────────────────────────────────
-function renderPlatformGrids() {
-  const platforms = state.platforms;
-  const srcGrid   = document.getElementById('src-grid');
-  const destGrid  = document.getElementById('dest-grid');
-  const srcSoon   = document.getElementById('src-soon');
-  const destSoon  = document.getElementById('dest-soon');
-  if (!srcGrid || !platforms) return;
-
-  srcGrid.innerHTML = destGrid.innerHTML = '';
-  if (srcSoon)  srcSoon.innerHTML  = '';
-  if (destSoon) destSoon.innerHTML = '';
-
-  Object.entries(platforms).forEach(([key, p]) => {
-    if (p.soon) {
-      // Plataformas em breve — separadas no card de futuros
-      if (srcSoon)  srcSoon.appendChild(makeSoonChip(key, p));
-      if (destSoon) destSoon.appendChild(makeSoonChip(key, p));
-    } else {
-      const srcDisabled = !p.can_read;
-      const dstDisabled = !p.can_write;
-      srcGrid.appendChild(makePlatformCard(key, p, 'src', srcDisabled));
-      destGrid.appendChild(makePlatformCard(key, p, 'dest', dstDisabled));
-    }
-  });
-}
 
 function makePlatformCard(key, p, role, disabled) {
   const div = document.createElement('div');
@@ -260,41 +223,6 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('playlist-url')?.addEventListener('input', checkTransferReady);
 });
 
-function renderConnectForms() {
-  const p = state.platforms;
-  document.getElementById('src-connect-title').textContent =
-    `Origem - ${p[state.srcPlatform]?.name || ''}${isSourceConnectionOptional(state.srcPlatform) ? ' (login opcional)' : ''}`;
-  document.getElementById('dest-connect-title').textContent =
-    `Destino - ${p[state.destPlatform]?.name || ''}`;
-
-  renderConnectForm(state.srcPlatform,  'src');
-  renderConnectForm(state.destPlatform, 'dest');
-}
-
-function renderConnectForm(platform, role) {
-  const container = document.getElementById(`${role}-connect-form`);
-  if (!container) return;
-  container.innerHTML = '';
-
-  const sid  = role === 'src' ? state.srcSid  : state.destSid;
-  const name = role === 'src' ? state.srcDisplayName : state.destDisplayName;
-
-  if (sid) {
-    container.appendChild(makeConnectionStatus(platform, role, name || 'Conectado'));
-    return;
-  }
-
-  switch (platform) {
-    case 'spotify':    container.appendChild(makeSpotifyForm(role)); break;
-    case 'deezer':     container.appendChild(makeDeezerForm(role)); break;
-    case 'youtube':    container.appendChild(makeYoutubeForm(role)); break;
-    case 'soundcloud': container.appendChild(makeSoundcloudForm(role)); break;
-    case 'apple':      container.appendChild(makeAppleForm(role)); break;
-    default:
-      container.innerHTML = `<p style="color:var(--color-muted);font-size:0.85rem;">
-        ${state.platforms[platform]?.name || platform} chegando em breve!</p>`;
-  }
-}
 
 function makeConnectionStatus(platform, role, displayName) {
   const div = document.createElement('div');
@@ -314,9 +242,6 @@ function makeConnectionStatus(platform, role, displayName) {
 
 const OPTIONAL_SOURCE_CONNECTIONS = new Set(['deezer', 'youtube', 'soundcloud', 'apple']);
 
-function isSourceConnectionOptional(platform) {
-  return OPTIONAL_SOURCE_CONNECTIONS.has(platform);
-}
 
 function isSourceReady() {
   return !!state.srcSid || isSourceConnectionOptional(state.srcPlatform);
@@ -368,323 +293,6 @@ function makeAdvancedDetails(summaryText, content, open = false) {
   return details;
 }
 
-function makeSpotifyForm(role) {
-  const wrapper = document.createElement('div');
-  if (state.platforms.spotify?.oauth_configured) {
-    wrapper.appendChild(makeOAuthForm('spotify', role, '#1DB954'));
-    const divider = document.createElement('div');
-    divider.className = 'divider';
-    divider.style.margin = '18px 0';
-    wrapper.appendChild(divider);
-  }
-  wrapper.appendChild(makeManualCredentialsForm({
-    platform: 'spotify',
-    role,
-    title: 'Conectar com cookie sp_dc',
-    subtitle: 'Funciona bem para ler playlists e criar a playlist final no Spotify.',
-    label: 'Cole o valor do cookie sp_dc:',
-    inputId: `${role}-spotify-cookie`,
-    placeholder: 'sp_dc=... ou apenas o valor do cookie',
-    statusId: `${role}-spotify-status`,
-    action: 'connectSpotify',
-    buttonLabel: 'Confirmar conexão →',
-    steps: [
-      'Abra o Spotify Web já logado na conta desejada.',
-      'Pressione F12 e vá em Application/Armazenamento > Cookies > https://open.spotify.com.',
-      'Copie o cookie chamado sp_dc e cole abaixo.',
-    ],
-  }));
-  return wrapper;
-}
-
-function makeDeezerForm(role) {
-  const wrapper = document.createElement('div');
-  if (state.platforms.deezer?.oauth_configured) {
-    wrapper.appendChild(makeOAuthForm('deezer', role, '#FF0092'));
-    const divider = document.createElement('div');
-    divider.className = 'divider';
-    divider.style.margin = '18px 0';
-    wrapper.appendChild(divider);
-  }
-  wrapper.appendChild(makeManualCredentialsForm({
-    platform: 'deezer',
-    role,
-    title: 'Conectar com cookie arl',
-    subtitle: 'Esse caminho é o mais confiável para criar playlists no Deezer.',
-    label: 'Cole o valor do cookie arl:',
-    inputId: `${role}-deezer-cookie`,
-    placeholder: 'arl=... ou apenas o valor do cookie',
-    statusId: `${role}-deezer-status`,
-    action: 'connectDeezer',
-    buttonLabel: 'Confirmar conexão →',
-    steps: [
-      'Abra o Deezer já logado na conta desejada.',
-      'Pressione F12 e vá em Application/Armazenamento > Cookies > https://www.deezer.com.',
-      'Copie o cookie chamado arl e cole abaixo.',
-    ],
-  }));
-  return wrapper;
-}
-
-// ── OAuth Form (Spotify / Deezer) ──────────────────────────
-function makeOAuthForm(platform, role, color) {
-  const p = state.platforms[platform] || {};
-  const configured = p.oauth_configured;
-  const names = { spotify: 'Spotify', deezer: 'Deezer' };
-  const name = names[platform] || platform;
-
-  const div = document.createElement('div');
-
-  if (!configured) {
-    // OAuth não configurado ainda — orienta o dono do app
-    div.innerHTML = `
-      <div class="oauth-config-notice">
-        <div class="oauth-icon" style="background:${color}20;color:${color};">
-          ${PLATFORM_ICONS[platform]}
-        </div>
-        <div>
-          <div style="font-weight:700;margin-bottom:4px;font-size:0.9rem;">Configure o ${name} OAuth</div>
-          <div style="font-size:0.78rem;color:var(--color-muted);line-height:1.6;">
-            Para ativar o login com ${name}, adicione as credenciais no arquivo <code>.env</code>.<br>
-            ${platform === 'spotify'
-              ? 'Acesse <a href="https://developer.spotify.com/dashboard" target="_blank">developer.spotify.com/dashboard</a>, crie um app e copie o Client ID e Client Secret.'
-              : 'Acesse <a href="https://developers.deezer.com/myapps" target="_blank">developers.deezer.com/myapps</a>, crie um app e copie o App ID e Secret Key.'
-            }
-          </div>
-        </div>
-      </div>
-    `;
-  } else {
-    div.innerHTML = `
-      <button class="btn-oauth" style="--oauth-color:${color};" onclick="openOAuthPopup('${platform}','${role}')">
-        <span class="btn-oauth-icon">${PLATFORM_ICONS[platform]}</span>
-        Entrar com ${name}
-        <span class="btn-oauth-arrow">→</span>
-      </button>
-      <div class="oauth-privacy-note">
-        🔒 Você será redirecionado ao site oficial do ${name}. Não armazenamos sua senha.
-      </div>
-    `;
-  }
-  return div;
-}
-
-// ── YouTube Music Form ─────────────────────────────────────
-function makeYoutubeForm(role) {
-  const div = document.createElement('div');
-  div.innerHTML = `
-    <div class="ytm-guide">
-      <div class="ytm-guide-header">
-        ${PLATFORM_ICONS.youtube}
-        <div>
-          <div style="font-weight:700;font-size:0.95rem;">Como conectar o YouTube Music</div>
-          <div style="font-size:0.75rem;color:var(--color-muted);">Leva menos de 1 minuto</div>
-        </div>
-      </div>
-
-      <div class="ytm-steps">
-        <div class="ytm-step">
-          <div class="ytm-step-num">1</div>
-          <div class="ytm-step-text">
-            Abra o <a href="https://music.youtube.com" target="_blank">YouTube Music</a> e faça login na sua conta Google.
-          </div>
-        </div>
-        <div class="ytm-step">
-          <div class="ytm-step-num">2</div>
-          <div class="ytm-step-text">
-            Pressione <kbd>F12</kbd> para abrir o Console do navegador.
-          </div>
-        </div>
-        <div class="ytm-step">
-          <div class="ytm-step-num">3</div>
-          <div class="ytm-step-text">
-            Clique na aba <strong>Network</strong> (Rede) e recarregue a página (<kbd>F5</kbd>).
-          </div>
-        </div>
-        <div class="ytm-step">
-          <div class="ytm-step-num">4</div>
-          <div class="ytm-step-text">
-            Na lista que aparecer, clique em qualquer item chamado <code>browse</code>.
-          </div>
-        </div>
-        <div class="ytm-step">
-          <div class="ytm-step-num">5</div>
-          <div class="ytm-step-text">
-            Clique com o botão direito → <strong>Copy</strong> → <strong>Copy as cURL (bash)</strong> e cole abaixo.
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="form-group" style="margin-top:16px;">
-      <label class="form-label" for="${role}-ytm-curl">Cole o texto copiado aqui:</label>
-      <textarea id="${role}-ytm-curl" class="form-input form-textarea"
-                placeholder="curl 'https://music.youtube.com/...' -H 'cookie: ...'"></textarea>
-    </div>
-    <button class="btn btn-secondary btn-sm" onclick="connectYoutube('${role}')">
-      Confirmar conexão →
-    </button>
-    <div id="${role}-ytm-status" style="margin-top:10px;font-size:0.8rem;color:var(--color-muted);"></div>
-  `;
-  return div;
-}
-
-// ── SoundCloud ─────────────────────────────────────────────
-function makeSoundcloudForm(role) {
-  const div = document.createElement('div');
-  div.innerHTML = `
-    <div class="soundcloud-auto-connect">
-      ${PLATFORM_ICONS.soundcloud}
-      <div>
-        <div style="font-weight:700;margin-bottom:4px;">SoundCloud — sem login necessário</div>
-        <div style="font-size:0.8rem;color:var(--color-muted);">
-          Playlists públicas do SoundCloud funcionam sem autenticação.
-        </div>
-      </div>
-      <button class="btn btn-secondary btn-sm" onclick="connectSoundcloud('${role}')">Usar SoundCloud</button>
-    </div>
-    <div id="${role}-sc-status" style="margin-top:8px;font-size:0.8rem;color:var(--color-muted);"></div>
-  `;
-  return div;
-}
-
-// ── Connect handlers ───────────────────────────────────────
-async function connectSpotify(role) {
-  const spDc = document.getElementById(`${role}-spotify-cookie`)?.value?.trim() || '';
-  const status = document.getElementById(`${role}-spotify-status`);
-  if (status) status.innerHTML = '<span class="spin-inline"></span> Verificando...';
-  try {
-    const r = await fetch('/api/connect/spotify', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sp_dc: spDc }),
-    });
-    const d = await r.json();
-    if (d.ok) {
-      if (role === 'src') { state.srcSid = d.sid; state.srcDisplayName = d.display_name; }
-      else { state.destSid = d.sid; state.destDisplayName = d.display_name; }
-      showToast('Spotify conectado!', 'success');
-      renderConnectForms();
-      checkTransferReady();
-    } else {
-      if (status) status.innerHTML = `âŒ ${escapeHtml(d.error)}`;
-      showToast(d.error, 'error');
-    }
-  } catch {
-    if (status) status.innerHTML = 'âŒ Erro de rede';
-    showToast('Erro ao conectar Spotify', 'error');
-  }
-}
-
-async function connectDeezer(role) {
-  const arl = document.getElementById(`${role}-deezer-cookie`)?.value?.trim() || '';
-  const status = document.getElementById(`${role}-deezer-status`);
-  if (status) status.innerHTML = '<span class="spin-inline"></span> Verificando...';
-  try {
-    const r = await fetch('/api/connect/deezer', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ arl }),
-    });
-    const d = await r.json();
-    if (d.ok) {
-      if (role === 'src') { state.srcSid = d.sid; state.srcDisplayName = d.display_name; }
-      else { state.destSid = d.sid; state.destDisplayName = d.display_name; }
-      showToast('Deezer conectado!', 'success');
-      renderConnectForms();
-      checkTransferReady();
-    } else {
-      if (status) status.innerHTML = `âŒ ${escapeHtml(d.error)}`;
-      showToast(d.error, 'error');
-    }
-  } catch {
-    if (status) status.innerHTML = 'âŒ Erro de rede';
-    showToast('Erro ao conectar Deezer', 'error');
-  }
-}
-
-async function connectYoutube(role) {
-  const headers = document.getElementById(`${role}-ytm-curl`)?.value?.trim();
-  if (!headers) { showToast('Cole o texto cURL do YouTube Music', 'warn'); return; }
-  const status = document.getElementById(`${role}-ytm-status`);
-  status.innerHTML = '<span class="spin-inline"></span> Verificando...';
-  try {
-    const r = await fetch('/api/connect/youtube', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ headers_raw: headers }),
-    });
-    const d = await r.json();
-    if (d.ok) {
-      if (role === 'src') { state.srcSid = d.sid; state.srcDisplayName = d.display_name; }
-      else { state.destSid = d.sid; state.destDisplayName = d.display_name; }
-      showToast(`YouTube Music conectado!`, 'success');
-      renderConnectForms();
-      checkTransferReady();
-    } else {
-      status.innerHTML = `❌ ${d.error}`;
-      showToast(d.error, 'error');
-    }
-  } catch { status.innerHTML = '❌ Erro de rede'; }
-}
-
-async function connectSoundcloud(role) {
-  const status = document.getElementById(`${role}-sc-status`);
-  if (status) status.innerHTML = '<span class="spin-inline"></span>';
-  try {
-    const r = await fetch('/api/connect/soundcloud', {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
-    });
-    const d = await r.json();
-    if (d.ok) {
-      if (role === 'src') { state.srcSid = d.sid; state.srcDisplayName = 'SoundCloud'; }
-      else { state.destSid = d.sid; state.destDisplayName = 'SoundCloud'; }
-      showToast('SoundCloud pronto!', 'success');
-      renderConnectForms();
-      checkTransferReady();
-    } else {
-      showToast(d.error, 'error');
-    }
-  } catch { showToast('Erro ao conectar SoundCloud', 'error'); }
-}
-
-async function connectApple(role) {
-  const status = document.getElementById(`${role}-apple-status`);
-  if (status) status.innerHTML = '<span class="spin-inline"></span>';
-  try {
-    const r = await fetch('/api/connect/apple', {
-      method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
-    });
-    const d = await r.json();
-    if (d.ok) {
-      if (role === 'src') { state.srcSid = d.sid; state.srcDisplayName = d.display_name; }
-      else { state.destSid = d.sid; state.destDisplayName = d.display_name; }
-      showToast('Apple Music pronta para leitura pública!', 'success');
-      renderConnectForms();
-      checkTransferReady();
-    } else {
-      showToast(d.error, 'error');
-    }
-  } catch { showToast('Erro ao preparar Apple Music', 'error'); }
-}
-
-function disconnect(role) {
-  clearRoleConnection(role);
-  renderConnectForms();
-  checkTransferReady();
-}
-
-// ── URL hint ───────────────────────────────────────────────
-function updateUrlHint() {
-  const hints = {
-    spotify:    'Ex.: https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M',
-    deezer:     'Ex.: https://www.deezer.com/br/playlist/1234567890',
-    youtube:    'Ex.: https://music.youtube.com/playlist?list=PLxxxxxx',
-    soundcloud: 'Ex.: https://soundcloud.com/usuario/sets/nome-da-playlist',
-    apple:      'Ex.: https://music.apple.com/br/playlist/nome/pl.xxxxxx',
-  };
-  const el = document.getElementById('url-hint');
-  if (el) el.textContent = hints[state.srcPlatform] || 'Cole o link completo da playlist.';
-}
 
 // ── Playlist Preview ───────────────────────────────────────
 async function previewPlaylist() {
@@ -733,14 +341,6 @@ function renderPreview(data) {
   `;
 }
 
-function checkTransferReady() {
-  const url = document.getElementById('playlist-url')?.value?.trim();
-  const srcOk  = !!state.srcSid;
-  const destOk = !!state.destSid;
-  const urlOk  = !!url;
-  const btn = document.getElementById('btn-transfer');
-  if (btn) btn.disabled = !(srcOk && destOk && urlOk);
-}
 
 // ── Transfer ───────────────────────────────────────────────
 async function startTransfer() {
@@ -847,11 +447,6 @@ function handleTransferDone(ev) {
   setTimeout(() => { showResult(ev); goToStep(4); }, 1200);
 }
 
-function handleTransferError(ev) {
-  clearInterval(state.pollTimer);
-  document.getElementById('progress-status').textContent = `Erro: ${ev.message}`;
-  showToast(`Erro: ${ev.message}`, 'error');
-}
 
 // ── Result ─────────────────────────────────────────────────
 function showResult(ev) {
@@ -937,78 +532,12 @@ function launchConfetti() {
 }
 
 // ── Toast ──────────────────────────────────────────────────
-function showToast(msg, type = 'info') {
-  const icons = { success: '✅', error: '❌', warn: '⚠️', info: 'ℹ️' };
-  const container = document.getElementById('toast-container');
-  clearToasts();
-  const toast = document.createElement('div');
-  toast.className = `toast ${type}`;
-  toast.innerHTML = `<div class="toast-icon">${icons[type]}</div><div class="toast-msg">${escapeHtml(msg)}</div>`;
-  container.appendChild(toast);
-  setTimeout(() => toast.remove(), 4500);
-}
 
 function escapeHtml(str) {
   if (!str) return '';
   return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-function makeManualCredentialsForm(config) {
-  const div = document.createElement('div');
-  div.innerHTML = `
-    <div class="ytm-guide">
-      <div class="ytm-guide-header">
-        ${PLATFORM_ICONS[config.platform]}
-        <div>
-          <div style="font-weight:700;font-size:0.95rem;">${config.title}</div>
-          <div style="font-size:0.75rem;color:var(--color-muted);">${config.subtitle}</div>
-        </div>
-      </div>
-
-      <div class="ytm-steps">
-        ${config.steps.map((step, idx) => `
-          <div class="ytm-step">
-            <div class="ytm-step-num">${idx + 1}</div>
-            <div class="ytm-step-text">${step}</div>
-          </div>
-        `).join('')}
-      </div>
-    </div>
-
-    <div class="form-group" style="margin-top:16px;">
-      <label class="form-label" for="${config.inputId}">${config.label}</label>
-      <textarea id="${config.inputId}" class="form-input form-textarea"
-                placeholder="${config.placeholder}"></textarea>
-      <div class="form-hint">
-        <span>ⓘ</span>
-        <span>Se o valor já estiver no arquivo <code>.env</code>, você pode deixar este campo vazio e só confirmar.</span>
-      </div>
-    </div>
-    <button class="btn btn-secondary btn-sm" onclick="${config.action}('${config.role}')">
-      ${config.buttonLabel}
-    </button>
-    <div id="${config.statusId}" style="margin-top:10px;font-size:0.8rem;color:var(--color-muted);"></div>
-  `;
-  return div;
-}
-
-function makeAppleForm(role) {
-  const div = document.createElement('div');
-  div.innerHTML = `
-    <div class="soundcloud-auto-connect">
-      ${PLATFORM_ICONS.apple}
-      <div>
-        <div style="font-weight:700;margin-bottom:4px;">Apple Music â€” leitura pÃºblica</div>
-        <div style="font-size:0.8rem;color:var(--color-muted);">
-          Use playlists pÃºblicas da Apple Music como origem sem precisar entrar na conta.
-        </div>
-      </div>
-      <button class="btn btn-secondary btn-sm" onclick="connectApple('${role}')">Usar Apple Music</button>
-    </div>
-    <div id="${role}-apple-status" style="margin-top:8px;font-size:0.8rem;color:var(--color-muted);"></div>
-  `;
-  return div;
-}
 
 Object.assign(PLATFORM_ICONS, {
   spotify: `<svg viewBox="0 0 24 24" fill="currentColor" style="width:28px;height:28px;color:#1DB954"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 14.44c-.2.32-.63.42-.95.22-2.6-1.59-5.87-1.95-9.72-1.07-.37.09-.75-.14-.84-.51-.09-.37.14-.75.51-.84 4.21-.96 7.82-.55 10.73 1.24.32.2.42.63.22.96zm1.24-2.76c-.25.4-.78.52-1.18.27-2.98-1.83-7.51-2.36-11.03-1.29-.46.14-.94-.12-1.08-.58-.14-.46.12-.94.58-1.08 4.02-1.22 9.01-.63 12.43 1.47.4.25.52.78.27 1.18zm.1-2.88C14.24 8.85 8.81 8.7 5.54 9.65c-.54.16-1.12-.14-1.28-.69-.16-.54.14-1.12.69-1.28 3.77-1.08 10.04-.87 14 1.52.49.29.65.92.36 1.41-.29.49-.92.65-1.41.36z"/></svg>`,
@@ -1038,27 +567,6 @@ function makeTextAreaField(id, label, placeholder) {
   `;
 }
 
-function renderPlatformGrids() {
-  const platforms = state.platforms;
-  const srcGrid = document.getElementById('src-grid');
-  const destGrid = document.getElementById('dest-grid');
-  const srcSoon = document.getElementById('src-soon');
-  const destSoon = document.getElementById('dest-soon');
-  if (!srcGrid || !destGrid || !platforms) return;
-
-  srcGrid.innerHTML = '';
-  destGrid.innerHTML = '';
-  if (srcSoon) srcSoon.innerHTML = '';
-  if (destSoon) destSoon.innerHTML = '';
-
-  Object.entries(platforms).forEach(([key, p]) => {
-    srcGrid.appendChild(makePlatformCard(key, p, 'src', !p.can_read));
-    destGrid.appendChild(makePlatformCard(key, p, 'dest', !p.can_write));
-  });
-
-  const soonSection = document.querySelector('.soon-section');
-  if (soonSection) soonSection.style.display = 'none';
-}
 
 function renderConnectForm(platform, role) {
   const container = document.getElementById(`${role}-connect-form`);
@@ -1085,142 +593,7 @@ function renderConnectForm(platform, role) {
   }
 }
 
-function makeSoundcloudForm(role) {
-  return makeManualCredentialsForm({
-    platform: 'soundcloud',
-    role,
-    title: role === 'src' ? 'Conectar SoundCloud (publico ou token)' : 'Conectar SoundCloud com token',
-    subtitle: role === 'src'
-      ? 'Origem pode funcionar sem token. Destino precisa de access token OAuth.'
-      : 'Para criar playlists no SoundCloud, informe um access token OAuth valido.',
-    label: role === 'src' ? 'Cole o access token (opcional):' : 'Cole o access token OAuth:',
-    inputId: `${role}-soundcloud-token`,
-    placeholder: 'access_token...',
-    statusId: `${role}-sc-status`,
-    action: 'connectSoundcloud',
-    buttonLabel: role === 'src' ? 'Usar SoundCloud' : 'Conectar SoundCloud',
-    steps: role === 'src'
-      ? [
-          'Se a playlist for publica, voce pode deixar o campo vazio.',
-          'Se quiser acessar conta privada ou usar como destino depois, cole o access token.',
-          'Confirme para liberar o SoundCloud neste lado da transferencia.',
-        ]
-      : [
-          'Crie ou obtenha um access token OAuth do SoundCloud.',
-          'Cole o token abaixo.',
-          'Confirme para permitir criacao de playlists na sua conta.',
-        ],
-  });
-}
 
-function makeAppleForm(role) {
-  const div = document.createElement('div');
-  const buttonLabel = role === 'src' ? 'Usar Apple Music' : 'Conectar Apple Music';
-  const title = role === 'src'
-    ? 'Apple Music publica ou autenticada'
-    : 'Apple Music com tokens';
-  const subtitle = role === 'src'
-    ? 'Origem publica funciona sem token. Para destino, os dois tokens sao obrigatorios.'
-    : 'Para criar playlists na Apple Music, informe developer token e music user token.';
-  div.innerHTML = `
-    <div class="ytm-guide">
-      <div class="ytm-guide-header">
-        ${PLATFORM_ICONS.apple}
-        <div>
-          <div style="font-weight:700;font-size:0.95rem;">${title}</div>
-          <div style="font-size:0.75rem;color:var(--color-muted);">${subtitle}</div>
-        </div>
-      </div>
-      <div class="ytm-steps">
-        <div class="ytm-step">
-          <div class="ytm-step-num">1</div>
-          <div class="ytm-step-text">Developer token vem da sua chave MusicKit no Apple Developer.</div>
-        </div>
-        <div class="ytm-step">
-          <div class="ytm-step-num">2</div>
-          <div class="ytm-step-text">Music user token autoriza a biblioteca da conta do usuario.</div>
-        </div>
-        <div class="ytm-step">
-          <div class="ytm-step-num">3</div>
-          <div class="ytm-step-text">${role === 'src' ? 'Se quiser so ler playlist publica, pode deixar em branco.' : 'Para destino, os campos abaixo precisam estar preenchidos.'}</div>
-        </div>
-      </div>
-    </div>
-    ${makeTextAreaField(`${role}-apple-developer-token`, 'Developer token', 'eyJhbGciOi...')}
-    ${makeTextAreaField(`${role}-apple-user-token`, 'Music user token', 'music-user-token...')}
-    ${makeTextInputField(`${role}-apple-storefront`, 'Storefront', 'us, br, gb...', 'us')}
-    <button class="btn btn-secondary btn-sm" onclick="connectApple('${role}')">${buttonLabel}</button>
-    <div id="${role}-apple-status" style="margin-top:10px;font-size:0.8rem;color:var(--color-muted);"></div>
-  `;
-  return div;
-}
-
-function makeAmazonForm(role) {
-  const div = document.createElement('div');
-  div.innerHTML = `
-    <div class="ytm-guide">
-      <div class="ytm-guide-header">
-        ${PLATFORM_ICONS.amazon}
-        <div>
-          <div style="font-weight:700;font-size:0.95rem;">Amazon Music Web API</div>
-          <div style="font-size:0.75rem;color:var(--color-muted);">Leitura e escrita exigem API key e access token da Web API oficial.</div>
-        </div>
-      </div>
-      <div class="ytm-steps">
-        <div class="ytm-step">
-          <div class="ytm-step-num">1</div>
-          <div class="ytm-step-text">Cole a API key da Amazon Music Web API.</div>
-        </div>
-        <div class="ytm-step">
-          <div class="ytm-step-num">2</div>
-          <div class="ytm-step-text">Cole o access token Bearer da conta.</div>
-        </div>
-        <div class="ytm-step">
-          <div class="ytm-step-num">3</div>
-          <div class="ytm-step-text">Defina o codigo do pais da conta, como US ou BR.</div>
-        </div>
-      </div>
-    </div>
-    ${makeTextInputField(`${role}-amazon-api-key`, 'API key', 'amzn1.application-oa2-client...')}
-    ${makeTextAreaField(`${role}-amazon-access-token`, 'Access token', 'Atza|IwEB...')}
-    ${makeTextInputField(`${role}-amazon-country-code`, 'Pais da conta', 'US', 'US')}
-    <button class="btn btn-secondary btn-sm" onclick="connectAmazon('${role}')">Conectar Amazon Music</button>
-    <div id="${role}-amazon-status" style="margin-top:10px;font-size:0.8rem;color:var(--color-muted);"></div>
-  `;
-  return div;
-}
-
-function makeTidalForm(role) {
-  const div = document.createElement('div');
-  div.innerHTML = `
-    <div class="ytm-guide">
-      <div class="ytm-guide-header">
-        ${PLATFORM_ICONS.tidal}
-        <div>
-          <div style="font-weight:700;font-size:0.95rem;">Conectar TIDAL</div>
-          <div style="font-size:0.75rem;color:var(--color-muted);">Use o login por device code. Funciona para origem e destino.</div>
-        </div>
-      </div>
-      <div class="ytm-steps">
-        <div class="ytm-step">
-          <div class="ytm-step-num">1</div>
-          <div class="ytm-step-text">Clique no botao para gerar um codigo do TIDAL.</div>
-        </div>
-        <div class="ytm-step">
-          <div class="ytm-step-num">2</div>
-          <div class="ytm-step-text">Abra o link oficial que sera mostrado abaixo.</div>
-        </div>
-        <div class="ytm-step">
-          <div class="ytm-step-num">3</div>
-          <div class="ytm-step-text">A pagina atualiza sozinha quando a conta autorizar.</div>
-        </div>
-      </div>
-    </div>
-    <button class="btn btn-secondary btn-sm" onclick="startTidalConnect('${role}')">Entrar com TIDAL</button>
-    <div id="${role}-tidal-status" style="margin-top:10px;font-size:0.8rem;color:var(--color-muted);"></div>
-  `;
-  return div;
-}
 
 async function connectSoundcloud(role) {
   const status = document.getElementById(`${role}-sc-status`);
@@ -1390,19 +763,6 @@ function disconnect(role) {
   checkTransferReady();
 }
 
-function updateUrlHint() {
-  const hints = {
-    spotify: 'Ex.: https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M',
-    deezer: 'Ex.: https://www.deezer.com/br/playlist/1234567890',
-    youtube: 'Ex.: https://music.youtube.com/playlist?list=PLxxxxxx',
-    soundcloud: 'Ex.: https://soundcloud.com/usuario/sets/nome-da-playlist',
-    apple: 'Ex.: https://music.apple.com/br/playlist/nome/pl.xxxxxx',
-    tidal: 'Ex.: https://listen.tidal.com/playlist/00000000-0000-0000-0000-000000000000',
-    amazon: 'Ex.: https://music.amazon.com/my/playlists/abcd1234',
-  };
-  const el = document.getElementById('url-hint');
-  if (el) el.textContent = hints[state.srcPlatform] || 'Cole o link completo da playlist.';
-}
 
 function renderConnectForms() {
   const p = state.platforms;
@@ -2068,272 +1428,6 @@ function makeTidalForm(role) {
   return div;
 }
 
-async function connectSpotify(role) {
-  const spDc = document.getElementById(`${role}-spotify-cookie`)?.value?.trim() || '';
-  const status = document.getElementById(`${role}-spotify-status`);
-  if (status) status.innerHTML = '<span class="spin-inline"></span> Conectando...';
-
-  try {
-    const r = await fetch('/api/connect/spotify', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sp_dc: spDc }),
-    });
-    const d = await r.json();
-
-    if (d.ok) {
-      if (role === 'src') {
-        state.srcSid = d.sid;
-        state.srcDisplayName = d.display_name;
-      } else {
-        state.destSid = d.sid;
-        state.destDisplayName = d.display_name;
-      }
-      showToast('Spotify conectado!', 'success');
-      renderConnectForms();
-      checkTransferReady();
-      return;
-    }
-
-    if (status) status.textContent = d.error || 'Falha ao conectar.';
-    showToast(d.error || 'Falha ao conectar Spotify', 'error');
-  } catch {
-    if (status) status.textContent = 'Erro de rede.';
-    showToast('Erro ao conectar Spotify', 'error');
-  }
-}
-
-function getPlatformCardAvailability(key, platform, role) {
-  if (role === 'src') {
-    if (!platform?.can_read) {
-      return { visible: false, disabled: true, badge: 'Indisponivel', meta: '' };
-    }
-
-    if (key === 'amazon') {
-      return { visible: true, disabled: true, badge: 'Avancado', meta: 'Exige API e token' };
-    }
-
-    return { visible: true, disabled: false, badge: '', meta: '' };
-  }
-
-  const visibleDestinations = new Set(['spotify', 'deezer', 'youtube', 'soundcloud', 'apple', 'tidal', 'amazon']);
-  if (!visibleDestinations.has(key)) {
-    return { visible: false, disabled: true, badge: 'Indisponivel', meta: '' };
-  }
-
-  if (key === 'tidal') {
-    return { visible: true, disabled: false, badge: '', meta: '' };
-  }
-
-  if (key === 'deezer') {
-    return { visible: true, disabled: false, badge: '', meta: '' };
-  }
-
-  if (key === 'spotify') {
-    return platform?.oauth_configured
-      ? { visible: true, disabled: false, badge: '', meta: '' }
-      : { visible: true, disabled: true, badge: 'Configurar', meta: 'Falta login oficial do site' };
-  }
-
-  return { visible: true, disabled: true, badge: 'Avancado', meta: 'Nao e fluxo de 1 clique' };
-}
-
-function makePlatformCard(key, p, role, options = false) {
-  const disabled = typeof options === 'boolean' ? options : !!options?.disabled;
-  const badge = typeof options === 'object' ? options?.badge || '' : (disabled ? (role === 'src' ? 'So destino' : 'So origem') : '');
-  const meta = typeof options === 'object' ? options?.meta || '' : '';
-
-  const div = document.createElement('div');
-  div.className = `platform-card${disabled ? ' disabled' : ''}`;
-  div.id = `${role}-${key}`;
-  div.style.color = p.color;
-
-  div.innerHTML = `
-    <div class="platform-glow" style="background:radial-gradient(circle at 50% 80%,${p.color}22,transparent 70%);"></div>
-    <div class="platform-icon" style="background:${p.color}18;">
-      ${PLATFORM_ICONS[key] || '🎵'}
-    </div>
-    <div class="platform-name">${p.name}</div>
-    ${meta ? `<div class="platform-meta">${meta}</div>` : ''}
-    ${badge ? `<div class="disabled-badge">${badge}</div>` : ''}
-    <div class="selected-check">✓</div>
-  `;
-
-  if (!disabled) {
-    div.addEventListener('click', () => selectPlatform(key, role));
-  }
-  return div;
-}
-
-function renderPlatformGrids() {
-  const platforms = state.platforms;
-  const srcGrid = document.getElementById('src-grid');
-  const destGrid = document.getElementById('dest-grid');
-  const srcSoon = document.getElementById('src-soon');
-  const destSoon = document.getElementById('dest-soon');
-  if (!srcGrid || !platforms) return;
-
-  srcGrid.innerHTML = '';
-  destGrid.innerHTML = '';
-  if (srcSoon) srcSoon.innerHTML = '';
-  if (destSoon) destSoon.innerHTML = '';
-
-  Object.entries(platforms).forEach(([key, platform]) => {
-    const srcState = getPlatformCardAvailability(key, platform, 'src');
-    const destState = getPlatformCardAvailability(key, platform, 'dest');
-
-    if (srcState.visible) {
-      srcGrid.appendChild(makePlatformCard(key, platform, 'src', srcState));
-    }
-
-    if (destState.visible) {
-      destGrid.appendChild(makePlatformCard(key, platform, 'dest', destState));
-    }
-  });
-
-  const srcState = state.srcPlatform ? getPlatformCardAvailability(state.srcPlatform, platforms[state.srcPlatform], 'src') : null;
-  const destState = state.destPlatform ? getPlatformCardAvailability(state.destPlatform, platforms[state.destPlatform], 'dest') : null;
-
-  if (state.srcPlatform && (!srcState?.visible || srcState.disabled)) {
-    clearRoleConnection('src');
-    state.srcPlatform = null;
-    resetPreviewPanel();
-  }
-
-  if (state.destPlatform && (!destState?.visible || destState.disabled)) {
-    clearRoleConnection('dest');
-    state.destPlatform = null;
-  }
-
-  const canContinue = state.srcPlatform && state.destPlatform && state.srcPlatform !== state.destPlatform;
-  document.getElementById('btn-step1-next').disabled = !canContinue;
-}
-
-function showToast(msg, type = 'info') {
-  const icons = { success: '✅', error: '❌', warn: '⚠️', info: 'ℹ️' };
-  const finalMsg = humanizePlatformError(msg);
-  const container = document.getElementById('toast-container');
-  clearToasts();
-  const toast = document.createElement('div');
-  toast.className = `toast ${type}`;
-  toast.innerHTML = `<div class="toast-icon">${icons[type]}</div><div class="toast-msg">${escapeHtml(finalMsg)}</div>`;
-  container.appendChild(toast);
-  setTimeout(() => toast.remove(), 4500);
-}
-
-function getPlatformCardAvailability(key, platform, role) {
-  if (role === 'src') {
-    if (!platform?.can_read) {
-      return { visible: false, disabled: true, badge: 'Indisponivel', meta: '' };
-    }
-
-    if (key === 'amazon') {
-      return { visible: true, disabled: true, badge: 'Avancado', meta: 'Exige API e token' };
-    }
-
-    return { visible: true, disabled: false, badge: '', meta: '' };
-  }
-
-  const visibleDestinations = new Set(['spotify', 'deezer', 'youtube', 'soundcloud', 'apple', 'tidal', 'amazon']);
-  if (!visibleDestinations.has(key)) {
-    return { visible: false, disabled: true, badge: 'Indisponivel', meta: '' };
-  }
-
-  if (key === 'tidal') {
-    return { visible: true, disabled: false, badge: '', meta: '' };
-  }
-
-  if (key === 'spotify' || key === 'deezer') {
-    return platform?.oauth_configured
-      ? { visible: true, disabled: false, badge: '', meta: '' }
-      : { visible: true, disabled: true, badge: 'Configurar', meta: 'Falta login oficial do site' };
-  }
-
-  return { visible: true, disabled: true, badge: 'Avancado', meta: 'Nao e fluxo de 1 clique' };
-}
-
-function makePlatformCard(key, p, role, options = false) {
-  const disabled = typeof options === 'boolean' ? options : !!options?.disabled;
-  const badge = typeof options === 'object' ? options?.badge || '' : (disabled ? (role === 'src' ? 'So destino' : 'So origem') : '');
-  const meta = typeof options === 'object' ? options?.meta || '' : '';
-
-  const div = document.createElement('div');
-  div.className = `platform-card${disabled ? ' disabled' : ''}`;
-  div.id = `${role}-${key}`;
-  div.style.color = p.color;
-
-  div.innerHTML = `
-    <div class="platform-glow" style="background:radial-gradient(circle at 50% 80%,${p.color}22,transparent 70%);"></div>
-    <div class="platform-icon" style="background:${p.color}18;">
-      ${PLATFORM_ICONS[key] || '🎵'}
-    </div>
-    <div class="platform-name">${p.name}</div>
-    ${meta ? `<div class="platform-meta">${meta}</div>` : ''}
-    ${badge ? `<div class="disabled-badge">${badge}</div>` : ''}
-    <div class="selected-check">✓</div>
-  `;
-
-  if (!disabled) {
-    div.addEventListener('click', () => selectPlatform(key, role));
-  }
-  return div;
-}
-
-function renderPlatformGrids() {
-  const platforms = state.platforms;
-  const srcGrid = document.getElementById('src-grid');
-  const destGrid = document.getElementById('dest-grid');
-  const srcSoon = document.getElementById('src-soon');
-  const destSoon = document.getElementById('dest-soon');
-  if (!srcGrid || !platforms) return;
-
-  srcGrid.innerHTML = '';
-  destGrid.innerHTML = '';
-  if (srcSoon) srcSoon.innerHTML = '';
-  if (destSoon) destSoon.innerHTML = '';
-
-  Object.entries(platforms).forEach(([key, platform]) => {
-    const srcState = getPlatformCardAvailability(key, platform, 'src');
-    const destState = getPlatformCardAvailability(key, platform, 'dest');
-
-    if (srcState.visible) {
-      srcGrid.appendChild(makePlatformCard(key, platform, 'src', srcState));
-    }
-
-    if (destState.visible) {
-      destGrid.appendChild(makePlatformCard(key, platform, 'dest', destState));
-    }
-  });
-
-  const srcState = state.srcPlatform ? getPlatformCardAvailability(state.srcPlatform, platforms[state.srcPlatform], 'src') : null;
-  const destState = state.destPlatform ? getPlatformCardAvailability(state.destPlatform, platforms[state.destPlatform], 'dest') : null;
-
-  if (state.srcPlatform && (!srcState?.visible || srcState.disabled)) {
-    clearRoleConnection('src');
-    state.srcPlatform = null;
-    resetPreviewPanel();
-  }
-
-  if (state.destPlatform && (!destState?.visible || destState.disabled)) {
-    clearRoleConnection('dest');
-    state.destPlatform = null;
-  }
-
-  const canContinue = state.srcPlatform && state.destPlatform && state.srcPlatform !== state.destPlatform;
-  document.getElementById('btn-step1-next').disabled = !canContinue;
-}
-
-function showToast(msg, type = 'info') {
-  const icons = { success: '✅', error: '❌', warn: '⚠️', info: 'ℹ️' };
-  const finalMsg = humanizePlatformError(msg);
-  const container = document.getElementById('toast-container');
-  clearToasts();
-  const toast = document.createElement('div');
-  toast.className = `toast ${type}`;
-  toast.innerHTML = `<div class="toast-icon">${icons[type]}</div><div class="toast-msg">${escapeHtml(finalMsg)}</div>`;
-  container.appendChild(toast);
-  setTimeout(() => toast.remove(), 4500);
-}
 
 async function connectDeezer(role) {
   const arl = document.getElementById(`${role}-deezer-cookie`)?.value?.trim() || '';
@@ -2543,32 +1637,12 @@ async function autoConnectDeezer(role) {
     // browser_cookie3 não disponível ou falhou, continua
   }
 
-  // Etapa 2: Abrir Deezer e tentar automação Chrome
+  // Etapa 2: Esperar o backend abrir a janela WebView segura e ler o ARL
   if (status) {
-    status.innerHTML = '<span class="spin-inline"></span> Abrindo o Deezer para capturar o login...';
+    status.innerHTML = '<span class="spin-inline"></span> Uma janela limpa de login do Deezer vai abrir na sua tela principal...';
   }
   if (hint) {
-    hint.textContent = 'O app esta tentando automaticamente. Nao precisa fazer nada.';
-  }
-
-  // Abre Deezer se ainda não está aberto
-  if (!state.deezerTabsOpened?.[role] || !deezerTabRefs[role] || deezerTabRefs[role]?.closed) {
-    const tab = openDeezerTab(role);
-    if (!tab) {
-      if (status) {
-        status.textContent = 'Nao consegui abrir o Deezer automaticamente. Abra o Deezer manualmente, entre na conta e use o modo manual abaixo.';
-      }
-      resetDeezerAutoBtn(role);
-      return;
-    }
-    // Espera o Deezer carregar
-    await new Promise(resolve => setTimeout(resolve, 3500));
-  }
-
-  // Foca na aba do Deezer para a automação funcionar
-  const deezerTab = deezerTabRefs[role];
-  if (deezerTab && !deezerTab.closed) {
-    try { deezerTab.focus(); } catch {}
+    hint.textContent = 'Faca o login na janela que acabou de abrir. Ela fechara sozinha quando der certo.';
   }
 
   if (status) {
@@ -2980,27 +2054,6 @@ function checkTransferReady() {
   if (btn) btn.disabled = !(srcOk && destOk && urlOk);
 }
 
-function updateUrlHint() {
-  const hints = {
-    spotify: 'Ex.: https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M',
-    deezer: 'Ex.: https://www.deezer.com/br/playlist/1234567890',
-    youtube: 'Ex.: https://music.youtube.com/playlist?list=PLxxxxxx',
-    soundcloud: 'Ex.: https://soundcloud.com/usuario/sets/nome-da-playlist',
-    apple: 'Ex.: https://music.apple.com/br/playlist/nome/pl.xxxxxx',
-    tidal: 'Ex.: https://listen.tidal.com/playlist/00000000-0000-0000-0000-000000000000',
-    amazon: 'Ex.: https://music.amazon.com/my/playlists/abcd1234',
-  };
-
-  let hint = hints[state.srcPlatform] || 'Cole o link completo da playlist.';
-  if (isSourceConnectionOptional(state.srcPlatform)) {
-    hint += ' Para playlists publicas, voce pode pular o login da origem.';
-  } else if (state.srcPlatform === 'spotify') {
-    hint += ' Se a playlist for privada ou muito grande, entre no Spotify antes.';
-  }
-
-  const el = document.getElementById('url-hint');
-  if (el) el.textContent = hint;
-}
 
 function getOAuthConsentCopy(platform, role) {
   const names = { spotify: 'Spotify', deezer: 'Deezer' };

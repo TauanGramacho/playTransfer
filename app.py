@@ -2,7 +2,7 @@
 app.py — PlayTransfer
 Servidor Flask principal — OAuth + API REST + worker threads
 """
-import base64, hashlib, json, os, subprocess, tempfile, time, threading, traceback, secrets, urllib.parse
+import base64, hashlib, json, os, subprocess, sys, tempfile, time, threading, traceback, secrets, urllib.parse
 import requests as req_lib
 from flask import Flask, render_template, request, jsonify, redirect, session, abort
 from dotenv import load_dotenv
@@ -281,13 +281,16 @@ DEEZER_SECRET_KEY = os.getenv("DEEZER_SECRET_KEY", "")
 
 @app.route("/auth/deezer")
 def auth_deezer():
+    if not DEEZER_APP_ID:
+        return redirect("/oauth-callback?error=deezer_oauth_not_configured")
+
     role = request.args.get("role", "src")
     state = secrets.token_urlsafe(16)
     oauth_states[state] = {"role": role, "platform": "deezer"}
 
     params = {
-        "app_id":  DEEZER_APP_ID or "demo",
-        "redirect_uri": f"{BASE_URL}/auth/deezer/callback",
+        "app_id":  DEEZER_APP_ID,
+        "redirect_uri": build_callback_url("deezer"),
         "perms":   "basic_access,manage_library",
         "state":   state,
     }
@@ -303,7 +306,10 @@ def auth_deezer_callback():
     if error or not code:
         return redirect(f"/oauth-callback?error={error or 'cancelled'}")
 
-    meta = oauth_states.pop(state, {})
+    meta = oauth_states.pop(state, None)
+    if not meta or meta.get("platform") != "deezer":
+        return redirect("/oauth-callback?error=invalid_state")
+
     role = meta.get("role", "src")
 
     r = req_lib.get(
@@ -443,133 +449,51 @@ def _run_deezer_chrome_guided_capture(role: str):
         "status": "pending",
         "error": "",
         "arl": "",
-        "step": "starting",
+        "step": "running_webview",
         "updated_at": time.time(),
     })
 
-    js_payload = "(function(){var a=(document.cookie.match(/(?:^|;\\s*)arl=([^;]+)/)||['',''])[1];prompt('PLAYTRANSFER', a);})();void(0);"
-    js_b64 = base64.b64encode(js_payload.encode("utf-8")).decode("ascii")
-
-    ps_script = f"""
-$ErrorActionPreference = 'Stop'
-$wshell = New-Object -ComObject WScript.Shell
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-public static class WinApi {{
-  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-  [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
-  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
-}}
-"@
-$foreground = [WinApi]::GetForegroundWindow()
-if ($foreground -eq [IntPtr]::Zero) {{ throw 'chrome_window_not_found' }}
-[WinApi]::ShowWindowAsync($foreground, 9) | Out-Null
-Start-Sleep -Milliseconds 120
-[WinApi]::SetForegroundWindow($foreground) | Out-Null
-$browserPid = [uint32]0
-[WinApi]::GetWindowThreadProcessId($foreground, [ref]$browserPid) | Out-Null
-if ($browserPid -eq 0) {{ throw 'chrome_window_not_found' }}
-$null = $wshell.AppActivate([int]$browserPid)
-Start-Sleep -Milliseconds 300
-
-$wshell.SendKeys('{{ESC}}')
-Start-Sleep -Milliseconds 80
-
-Set-Clipboard -Value ''
-$consoleCommand = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{js_b64}'))
-Set-Clipboard -Value $consoleCommand
-
-$wshell.SendKeys('{{F6}}')
-Start-Sleep -Milliseconds 150
-$wshell.SendKeys('^l')
-Start-Sleep -Milliseconds 150
-$wshell.SendKeys('javascript:')
-Start-Sleep -Milliseconds 80
-$wshell.SendKeys('^v')
-Start-Sleep -Milliseconds 150
-$wshell.SendKeys('{{ENTER}}')
-Start-Sleep -Milliseconds 1200
-
-Set-Clipboard -Value ''
-$wshell.SendKeys('^a')
-Start-Sleep -Milliseconds 80
-$wshell.SendKeys('^c')
-Start-Sleep -Milliseconds 250
-$wshell.SendKeys('{{ESC}}')
-Start-Sleep -Milliseconds 150
-
-$capturedArl = ''
-try {{
-  $capturedArl = (Get-Clipboard -Raw).Trim()
-}} catch {{
-  $capturedArl = ''
-}}
-
-if (-not $capturedArl) {{
-  throw 'missing_arl'
-}}
-if ($capturedArl.Contains('document.cookie') -or $capturedArl.StartsWith('javascript:')) {{
-  throw 'missing_arl'
-}}
-Write-Output $capturedArl
-"""
-
-    attempt["step"] = "running_chrome"
-    attempt["updated_at"] = time.time()
-
     try:
-        with tempfile.NamedTemporaryFile("w", delete=False, suffix=".ps1", encoding="utf-8") as fh:
-            fh.write(ps_script)
-            script_path = fh.name
+        # Pega o caminho do ambiente virtual se existir, se não usa sys.executable
+        python_exe = sys.executable
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deezer_webview.py")
+        
         completed = subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script_path],
-            check=True,
+            [python_exe, script_path],
             capture_output=True,
             text=True,
-            timeout=20,
+            timeout=70,
         )
     except subprocess.TimeoutExpired:
         attempt.update({
             "status": "error",
-            "error": "A automacao do Chrome demorou mais do que o esperado.",
+            "error": "A janela de login demorou muito e foi encerrada.",
             "step": "timed_out",
-            "updated_at": time.time(),
-        })
-        return
-    except subprocess.CalledProcessError as exc:
-        stderr = (exc.stderr or "").strip()
-        stdout = (exc.stdout or "").strip()
-        detail = stderr or stdout or str(exc)
-        attempt.update({
-            "status": "error",
-            "error": f"Nao consegui automatizar o Chrome agora: {detail}",
-            "step": "automation_failed",
             "updated_at": time.time(),
         })
         return
     except Exception as exc:
         attempt.update({
             "status": "error",
-            "error": f"Nao consegui automatizar o Chrome agora: {exc}",
+            "error": f"Erro abrindo a janela de login: {exc}",
             "step": "automation_failed",
             "updated_at": time.time(),
         })
         return
-    finally:
-        try:
-            if 'script_path' in locals() and os.path.exists(script_path):
-                os.remove(script_path)
-        except Exception:
-            pass
 
-    captured_arl = (completed.stdout or "").strip()
-    if captured_arl and len(captured_arl) > 20:
+    output = completed.stdout or ""
+    arl = ""
+    for line in output.splitlines():
+        if line.startswith("ARL_FOUND:"):
+            arl = line.split("ARL_FOUND:")[1].strip()
+            # As vezes pywebview retorna como dict/json, limpando possivel aspas:
+            arl = arl.strip("'").strip('"')
+
+    if arl and len(arl) > 20:
         attempt.update({
             "status": "captured",
             "error": "",
-            "arl": captured_arl,
+            "arl": arl,
             "step": "captured",
             "updated_at": time.time(),
         })
