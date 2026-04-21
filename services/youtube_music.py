@@ -126,9 +126,10 @@ def _ensure_required_cookie(cookie_header: str) -> str:
     if "__Secure-3PAPISID=" in normalized:
         return normalized
 
-    sapisid = _extract_cookie_value(normalized, "SAPISID")
-    if sapisid:
-        return normalized + f"; __Secure-3PAPISID={sapisid}"
+    for cookie_name in ("SAPISID", "__Secure-1PAPISID", "APISID"):
+        candidate = _extract_cookie_value(normalized, cookie_name)
+        if candidate:
+            return normalized + f"; __Secure-3PAPISID={candidate}"
 
     raise ValueError("Nao consegui confirmar a sessao do Google nessa janela.")
 

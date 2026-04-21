@@ -26,6 +26,8 @@ sessions: dict[str, dict] = {}
 oauth_states: dict[str, dict] = {}   # state → {role, platform, ...}
 tidal_logins: dict[str, dict] = {}
 youtube_logins: dict[str, dict] = {}
+youtube_guided_logins: dict[str, dict] = {}
+spotify_browser_guided: dict[str, dict] = {}
 deezer_browser_guided: dict[str, dict] = {}
 
 BASE_URL = os.getenv("BASE_URL", "").strip()
@@ -264,6 +266,7 @@ def auth_spotify_callback():
         "spotify",
         access_token=access_token,
         refresh_token=token_data.get("refresh_token", ""),
+        auth_source="oauth",
         display_name=display_name,
         avatar=avatar,
     )
@@ -369,20 +372,76 @@ def connect_spotify_manual():
     from services import spotify
 
     data = request.json or {}
+    role = str(data.get("role") or "").strip().lower()
+    if role not in {"src", "dest"}:
+        role = ""
+
+    access_token = data.get("access_token")
+    if not isinstance(access_token, str):
+        access_token = ""
+    access_token = access_token.strip()
+
+    client_token = data.get("client_token") or data.get("spotify_client_token") or ""
+    if not isinstance(client_token, str):
+        client_token = ""
+    client_token = client_token.strip()
+
     raw_cookie_input = data.get("sp_dc")
     if not isinstance(raw_cookie_input, str):
         raw_cookie_input = ""
     raw_cookie_input = (raw_cookie_input or os.getenv("SPOTIFY_SP_DC", "")).strip()
-    cookie_header = raw_cookie_input
+
+    cookie_header = data.get("cookie_header") or data.get("spotify_cookie_header") or raw_cookie_input
+    if not isinstance(cookie_header, str):
+        cookie_header = ""
+    cookie_header = cookie_header.strip()
     if cookie_header.lower().startswith("cookie:"):
         cookie_header = cookie_header.split(":", 1)[1].strip()
 
     sp_dc = raw_cookie_input
     if "sp_dc=" in sp_dc:
         sp_dc = sp_dc.split("sp_dc=", 1)[1].split(";", 1)[0].strip()
+    if not sp_dc and "sp_dc=" in cookie_header:
+        sp_dc = cookie_header.split("sp_dc=", 1)[1].split(";", 1)[0].strip()
 
     if "sp_dc=" not in cookie_header and "sp_key=" not in cookie_header:
         cookie_header = ""
+
+    if access_token:
+        trusted_webview = bool(data.get("trusted_webview"))
+        if trusted_webview:
+            display_name = str(data.get("display_name") or "").strip() or "Conta Spotify"
+            info = {"display_name": display_name, "avatar": ""}
+        else:
+            try:
+                info = spotify.validate_access_token(access_token, client_token=client_token)
+            except spotify.SpotifyRateLimitedError as exc:
+                wait_seconds = int(exc.retry_after or 60)
+                return jsonify({
+                    "ok": False,
+                    "error": (
+                        "Spotify ainda esta pausando essa sessao. "
+                        f"Aguarde cerca de {wait_seconds}s e conecte o Spotify novamente antes de transferir."
+                    ),
+                })
+            except Exception as e:
+                return jsonify({"ok": False, "error": str(e)})
+
+        try:
+            sid = create_session(
+                "spotify",
+                sp_dc=sp_dc,
+                spotify_cookie_header=cookie_header,
+                spotify_client_token=client_token,
+                access_token=access_token,
+                refresh_token="",
+                auth_source="webview" if trusted_webview else "manual",
+                display_name=info["display_name"],
+                avatar=info.get("avatar", ""),
+            )
+            return jsonify({"ok": True, "sid": sid, "display_name": info["display_name"]})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)})
 
     try:
         info = spotify.validate(sp_dc=sp_dc, cookie_header=cookie_header or None)
@@ -390,6 +449,7 @@ def connect_spotify_manual():
             "spotify",
             sp_dc=sp_dc,
             spotify_cookie_header=cookie_header,
+            spotify_client_token=client_token,
             access_token=spotify.get_token_via_sp_dc(sp_dc=sp_dc, cookie_header=cookie_header or None),
             refresh_token="",
             display_name=info["display_name"],
@@ -398,6 +458,165 @@ def connect_spotify_manual():
         return jsonify({"ok": True, "sid": sid, "display_name": info["display_name"]})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+@app.route("/api/connect/spotify/browser-cookie", methods=["POST"])
+def connect_spotify_browser_cookie():
+    from services import spotify
+
+    try:
+        found = spotify.read_saved_spotify_cookie()
+        return jsonify({
+            "ok": True,
+            "sp_dc": found.get("sp_dc", ""),
+            "cookie_header": found.get("cookie_header", ""),
+            "browser": found.get("browser", ""),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+def _run_spotify_guided_capture(role: str):
+    attempt = spotify_browser_guided.setdefault(role, {})
+    attempt.update({
+        "status": "pending",
+        "error": "",
+        "access_token": "",
+        "client_token": "",
+        "sp_dc": "",
+        "cookie_header": "",
+        "step": "running_webview",
+        "updated_at": time.time(),
+    })
+
+    try:
+        python_exe = sys.executable
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "spotify_webview.py")
+
+        completed = subprocess.run(
+            [python_exe, script_path],
+            capture_output=True,
+            text=True,
+            timeout=150,
+        )
+    except subprocess.TimeoutExpired:
+        attempt.update({
+            "status": "error",
+            "error": "A janela de login do Spotify demorou muito e foi encerrada.",
+            "step": "timed_out",
+            "updated_at": time.time(),
+        })
+        return
+    except Exception as exc:
+        attempt.update({
+            "status": "error",
+            "error": str(exc),
+            "step": "spawn_failed",
+            "updated_at": time.time(),
+        })
+        return
+
+    payload = {}
+    aborted = False
+    timed_out = False
+
+    for raw_line in (completed.stdout or "").splitlines():
+        line = raw_line.strip()
+        if line.startswith("SPOTIFY_FOUND:"):
+            try:
+                payload = json.loads(line.split("SPOTIFY_FOUND:", 1)[1].strip())
+            except Exception:
+                payload = {}
+        elif line.startswith("SPOTIFY_ABORTED:"):
+            aborted = True
+        elif line.startswith("SPOTIFY_TIMEOUT:"):
+            timed_out = True
+
+    access_token = str(payload.get("access_token") or "").strip()
+    client_token = str(payload.get("client_token") or "").strip()
+    sp_dc = str(payload.get("sp_dc") or "").strip()
+    cookie_header = str(payload.get("cookie_header") or "").strip()
+
+    if access_token:
+        attempt.update({
+            "status": "captured",
+            "error": "",
+            "access_token": access_token,
+            "client_token": client_token,
+            "sp_dc": sp_dc,
+            "cookie_header": cookie_header,
+            "step": "captured",
+            "updated_at": time.time(),
+        })
+        return
+
+    if aborted:
+        attempt.update({
+            "status": "error",
+            "error": "Voce fechou a janela do Spotify antes de concluir o login.",
+            "step": "aborted",
+            "updated_at": time.time(),
+        })
+        return
+
+    if timed_out:
+        attempt.update({
+            "status": "error",
+            "error": "A janela do Spotify demorou muito e foi encerrada.",
+            "step": "timed_out",
+            "updated_at": time.time(),
+        })
+        return
+
+    attempt.update({
+        "status": "error",
+        "error": "missing_spotify_token",
+        "step": "no_capture",
+        "updated_at": time.time(),
+    })
+
+
+@app.route("/api/connect/spotify/browser-guided/start", methods=["POST"])
+def connect_spotify_browser_guided_start():
+    data = request.json or {}
+    role = str(data.get("role") or "dest").strip() or "dest"
+
+    spotify_browser_guided[role] = {
+        "status": "pending",
+        "error": "",
+        "access_token": "",
+        "client_token": "",
+        "sp_dc": "",
+        "cookie_header": "",
+        "step": "queued",
+        "updated_at": time.time(),
+    }
+    threading.Thread(target=_run_spotify_guided_capture, args=(role,), daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
+@app.route("/api/connect/spotify/browser-guided/status")
+def connect_spotify_browser_guided_status():
+    role = str(request.args.get("role") or "dest").strip() or "dest"
+    data = spotify_browser_guided.get(role) or {
+        "status": "idle",
+        "error": "",
+        "access_token": "",
+        "client_token": "",
+        "sp_dc": "",
+        "cookie_header": "",
+        "step": "idle",
+        "updated_at": 0,
+    }
+    return jsonify({
+        "ok": True,
+        "status": data.get("status", "idle"),
+        "error": data.get("error", ""),
+        "access_token": data.get("access_token", ""),
+        "client_token": data.get("client_token", ""),
+        "sp_dc": data.get("sp_dc", ""),
+        "cookie_header": data.get("cookie_header", ""),
+        "step": data.get("step", "idle"),
+        "updated_at": data.get("updated_at", 0),
+    })
 
 
 @app.route("/api/connect/deezer", methods=["POST"])
@@ -462,7 +681,7 @@ def _run_deezer_chrome_guided_capture(role: str):
             [python_exe, script_path],
             capture_output=True,
             text=True,
-            timeout=70,
+            timeout=120,
         )
     except subprocess.TimeoutExpired:
         attempt.update({
@@ -482,6 +701,26 @@ def _run_deezer_chrome_guided_capture(role: str):
         return
 
     output = completed.stdout or ""
+    error_output = (completed.stderr or "").strip()
+    if completed.returncode not in (0, None):
+        attempt.update({
+            "status": "error",
+            "error": error_output or output.strip() or "Falha ao abrir a janela de login do Deezer.",
+            "step": "automation_failed",
+            "updated_at": time.time(),
+        })
+        return
+
+    if "ARL_TIMEOUT" in output or "ARL_ABORTED" in output:
+        timeout_detail = output.strip()
+        attempt.update({
+            "status": "error",
+            "error": timeout_detail or "A janela de login do Deezer foi fechada antes da captura terminar.",
+            "step": "timed_out",
+            "updated_at": time.time(),
+        })
+        return
+
     arl = ""
     for line in output.splitlines():
         if line.startswith("ARL_FOUND:"):
@@ -640,6 +879,63 @@ def connect_youtube_auto_finish():
         return jsonify({"ok": False, "error": str(e)})
 
 
+@app.route("/api/connect/youtube/guided/start", methods=["POST"])
+def connect_youtube_guided_start():
+    from services import youtube_music
+
+    try:
+        login = youtube_music.start_guided_login()
+        login_id = os.urandom(8).hex()
+        youtube_guided_logins[login_id] = {**login, "started_at": time.time()}
+        return jsonify({
+            "ok": True,
+            "pending": True,
+            "login_id": login_id,
+            "browser_name": login.get("browser_name", ""),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/connect/youtube/guided/finish", methods=["POST"])
+def connect_youtube_guided_finish():
+    from services import youtube_music
+
+    data = request.json or {}
+    login_id = (data.get("login_id") or "").strip()
+    login = youtube_guided_logins.get(login_id)
+
+    if not login:
+        return jsonify({"ok": False, "error": "A janela guiada do YouTube Music expirou. Abra novamente."})
+
+    try:
+        info = youtube_music.finish_guided_login(login)
+        sid = create_session(
+            "youtube",
+            headers_path=info["headers_path"],
+            display_name=info["display_name"],
+        )
+        youtube_music.cleanup_guided_login(login, close_browser=True)
+        youtube_guided_logins.pop(login_id, None)
+        return jsonify({"ok": True, "sid": sid, "display_name": info["display_name"]})
+    except Exception as e:
+        message = str(e)
+        if (
+            "Ainda nao consegui confirmar sua conta do YouTube Music" in message
+            or "Nao consegui confirmar a sessao do Google nessa janela." in message
+            or "Nao consegui confirmar essa conta do YouTube Music." in message
+        ):
+            return jsonify({
+                "ok": False,
+                "pending": True,
+                "retry_after_ms": 2500,
+            })
+
+        youtube_music.cleanup_guided_login(login, close_browser=False)
+        youtube_guided_logins.pop(login_id, None)
+        return jsonify({"ok": False, "error": message})
+
+
 @app.route("/api/connect/soundcloud", methods=["POST"])
 def connect_soundcloud():
     from services import soundcloud
@@ -649,6 +945,10 @@ def connect_soundcloud():
     access_token = (data.get("access_token") or os.getenv("SOUNDCLOUD_ACCESS_TOKEN", "")).strip()
 
     try:
+        if role == "src" and not access_token:
+            sid = create_session("soundcloud", access_token="", display_name="SoundCloud (publico)", avatar="")
+            return jsonify({"ok": True, "sid": sid, "display_name": "SoundCloud (publico)"})
+
         if role == "dest" and not access_token:
             raise ValueError("Para usar SoundCloud como destino, informe um access token.")
 
@@ -787,6 +1087,16 @@ def api_platforms():
     p["spotify"]["oauth_configured"] = bool(SPOTIFY_CLIENT_ID)
     p["spotify"]["oauth_mode"] = "pkce" if (SPOTIFY_CLIENT_ID and not SPOTIFY_CLIENT_SECRET) else "server"
     p["deezer"]["oauth_configured"]  = bool(DEEZER_APP_ID and DEEZER_SECRET_KEY)
+    p["soundcloud"]["auto_configured"] = bool(os.getenv("SOUNDCLOUD_ACCESS_TOKEN", "").strip())
+    p["apple"]["auto_configured"] = bool(
+        os.getenv("APPLE_MUSIC_DEVELOPER_TOKEN", "").strip()
+        and os.getenv("APPLE_MUSIC_USER_TOKEN", "").strip()
+    )
+    p["amazon"]["auto_configured"] = bool(
+        os.getenv("AMAZON_MUSIC_API_KEY", "").strip()
+        and os.getenv("AMAZON_MUSIC_ACCESS_TOKEN", "").strip()
+    )
+    p["tidal"]["auto_configured"] = True
     try:
         from services import youtube_music
         p["youtube"]["oauth_configured"] = youtube_music.oauth_configured()
@@ -935,30 +1245,150 @@ def run_transfer(job: dict, data: dict):
             from services import spotify
 
             dest_sess = sessions.get(dest_sid, {})
+            is_official_spotify_login = dest_sess.get("auth_source") == "oauth"
             access_token = dest_sess.get("access_token")
             sp_dc = dest_sess.get("sp_dc")
             cookie_header = dest_sess.get("spotify_cookie_header", "")
+            client_token = dest_sess.get("spotify_client_token", "")
             if not access_token and (sp_dc or cookie_header):
                 access_token = spotify.get_token_via_sp_dc(sp_dc=sp_dc, cookie_header=cookie_header)
             if not access_token:
                 raise ValueError("Sessão do Spotify não encontrada. Reconecte o Spotify.")
 
-            playlist_id = spotify.create_playlist(access_token, nome, "Transferida via PlayTransfer")
+            def refresh_spotify_token():
+                nonlocal access_token
+                if not (sp_dc or cookie_header):
+                    return False
+                try:
+                    fresh_token = spotify.get_token_via_sp_dc(sp_dc=sp_dc, cookie_header=cookie_header)
+                except Exception as exc:
+                    print(f"[Spotify] Nao consegui renovar token: {exc}")
+                    return False
+                if not fresh_token:
+                    return False
+                access_token = fresh_token
+                if dest_sid in sessions:
+                    sessions[dest_sid]["access_token"] = fresh_token
+                return True
+
+            if sp_dc or cookie_header:
+                refresh_spotify_token()
+
+            def spotify_with_visible_wait(
+                action_label,
+                action,
+                attempts=5,
+                max_wait_seconds=75,
+                max_total_wait_seconds=240,
+                refresh_on_first_limit=False,
+            ):
+                last_error = None
+                total_waited = 0
+                refreshed_after_limit = False
+
+                for attempt in range(attempts):
+                    try:
+                        if attempt:
+                            emit(job, {"type": "status", "msg": f"Tentando {action_label} no Spotify..."})
+                        return action()
+                    except spotify.SpotifyRateLimitedError as exc:
+                        last_error = exc
+
+                        if refresh_on_first_limit and not refreshed_after_limit and refresh_spotify_token():
+                            refreshed_after_limit = True
+                            emit(job, {
+                                "type": "status",
+                                "msg": "Atualizei a sessao do Spotify. Tentando de novo..."
+                            })
+                            continue
+
+                        if attempt >= attempts - 1:
+                            break
+
+                        wait_seconds = exc.retry_after
+                        if wait_seconds is None:
+                            wait_seconds = min(20 + (attempt * 15), max_wait_seconds)
+
+                        wait_seconds = int(max(5, min(float(wait_seconds) + 6, max_wait_seconds)))
+                        remaining_budget = max_total_wait_seconds - total_waited
+                        if remaining_budget <= 0:
+                            break
+                        wait_seconds = min(wait_seconds, remaining_budget)
+
+                        while wait_seconds > 0:
+                            emit(job, {
+                                "type": "status",
+                                "msg": f"Spotify pediu uma pausa. Tentando {action_label} novamente em {wait_seconds}s..."
+                            })
+                            chunk = min(5, wait_seconds)
+                            time.sleep(chunk)
+                            total_waited += chunk
+                            wait_seconds -= chunk
+
+                if last_error:
+                    raise last_error
+                raise ValueError("Spotify não respondeu à tentativa de transferência.")
+
+            emit(job, {"type": "status", "msg": "Criando playlist no Spotify..."})
+            try:
+                playlist_id = spotify_with_visible_wait(
+                    "criar a playlist",
+                    lambda: spotify.create_playlist(
+                        access_token,
+                        nome,
+                        "Transferida via PlayTransfer",
+                        client_token=client_token,
+                    ),
+                    attempts=6 if is_official_spotify_login else 4,
+                    max_wait_seconds=70,
+                    max_total_wait_seconds=240 if is_official_spotify_login else 210,
+                    refresh_on_first_limit=True,
+                )
+            except spotify.SpotifyRateLimitedError as exc:
+                if not is_official_spotify_login:
+                    raise ValueError(
+                        "O Spotify ainda esta pausando esta conta agora. "
+                        "Tente novamente em alguns minutos."
+                    ) from exc
+                raise
             emit(job, {"type": "status", "msg": "Buscando músicas no Spotify..."})
 
             for i, m in enumerate(musicas):
-                track_id = spotify.search_track(access_token, m["titulo"], m["artista"], m.get("album", ""))
+                track_id = spotify_with_visible_wait(
+                    "buscar as musicas",
+                    lambda: spotify.search_track(
+                        access_token,
+                        m["titulo"],
+                        m["artista"],
+                        m.get("album", ""),
+                        client_token=client_token,
+                    ),
+                    attempts=5,
+                    max_wait_seconds=60,
+                    max_total_wait_seconds=240,
+                )
                 if track_id:
                     ids_encontrados.append(track_id)
                 else:
                     falhas.append(m)
                 emit(job, {"type": "track", "titulo": m["titulo"], "artista": m["artista"],
                            "found": bool(track_id), "current": i + 1, "total": len(musicas)})
-                time.sleep(0.10)
+                time.sleep(0.35)
 
             if ids_encontrados:
                 emit(job, {"type": "status", "msg": "Adicionando faixas..."})
-                spotify.add_tracks(access_token, playlist_id, ids_encontrados)
+                spotify_with_visible_wait(
+                    "adicionar as musicas",
+                    lambda: spotify.add_tracks(
+                        access_token,
+                        playlist_id,
+                        ids_encontrados,
+                        client_token=client_token,
+                    ),
+                    attempts=8,
+                    max_wait_seconds=90,
+                    max_total_wait_seconds=420,
+                )
 
             dest_url = f"https://open.spotify.com/playlist/{playlist_id}"
 

@@ -12,7 +12,11 @@ const state = {
   destSid: null,
   srcDisplayName: null,
   destDisplayName: null,
+  spotifyAutoConnecting: {},
+  spotifyCapturePolls: {},
+  platformAutoConnecting: {},
   youtubePending: {},
+  youtubeAutoConnecting: {},
   deezerCapturePolls: {},
   deezerTabsOpened: {},
   platforms: {},
@@ -293,6 +297,32 @@ function makeAdvancedDetails(summaryText, content, open = false) {
   return details;
 }
 
+function openAdvancedConnection(detailsId, inputId = '') {
+  const details = document.getElementById(detailsId);
+  if (!details) return;
+  details.open = true;
+  details.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  if (inputId) {
+    setTimeout(() => document.getElementById(inputId)?.focus(), 140);
+  }
+}
+
+async function startYoutubeManualGuided(role) {
+  openAdvancedConnection(`${role}-youtube-manual-details`, `${role}-ytm-curl`);
+  const status = document.getElementById(`${role}-ytm-status`);
+  if (status) status.innerHTML = '<span class="spin-inline"></span> Tentando usar o que voce ja copiou...';
+
+  await pasteYoutubeFromClipboard(role);
+
+  const input = document.getElementById(`${role}-ytm-curl`);
+  const hasValue = !!String(input?.value || '').trim();
+  if (status) {
+    status.textContent = hasValue
+      ? 'Revise o texto colado e toque em "Conectar YouTube Music".'
+      : 'Copie a linha "browse" como cURL no navegador e cole aqui para continuar.';
+  }
+}
+
 
 // ── Playlist Preview ───────────────────────────────────────
 async function previewPlaylist() {
@@ -496,6 +526,14 @@ function newTransfer() {
   state.deezerTabsOpened = {};
   state.deezerCapturePolls = {};
   state.deezerAutoConnecting = {};
+  Object.values(state.spotifyCapturePolls || {}).forEach((timer) => {
+    if (timer) clearTimeout(timer);
+  });
+  state.spotifyCapturePolls = {};
+  state.spotifyAutoConnecting = {};
+  state.platformAutoConnecting = {};
+  state.youtubePending = {};
+  state.youtubeAutoConnecting = {};
   state.jobId = null; state.eventIdx = 0;
   if (state.pollTimer) clearInterval(state.pollTimer);
   document.getElementById('playlist-url').value = '';
@@ -612,13 +650,17 @@ async function connectSoundcloud(role) {
       showToast('SoundCloud conectado!', 'success');
       renderConnectForms();
       checkTransferReady();
+      return true;
     } else {
-      if (status) status.textContent = d.error || 'Falha ao conectar.';
-      showToast(d.error || 'Falha ao conectar SoundCloud', 'error');
+      const message = humanizePlatformError(d.error || 'Falha ao conectar SoundCloud');
+      if (status) status.textContent = message;
+      showToast(message, 'error');
+      return false;
     }
   } catch {
     if (status) status.textContent = 'Erro de rede.';
     showToast('Erro ao conectar SoundCloud', 'error');
+    return false;
   }
 }
 
@@ -646,13 +688,17 @@ async function connectApple(role) {
       showToast('Apple Music conectada!', 'success');
       renderConnectForms();
       checkTransferReady();
+      return true;
     } else {
-      if (status) status.textContent = d.error || 'Falha ao conectar.';
-      showToast(d.error || 'Falha ao conectar Apple Music', 'error');
+      const message = humanizePlatformError(d.error || 'Falha ao conectar Apple Music');
+      if (status) status.textContent = message;
+      showToast(message, 'error');
+      return false;
     }
   } catch {
     if (status) status.textContent = 'Erro de rede.';
     showToast('Erro ao conectar Apple Music', 'error');
+    return false;
   }
 }
 
@@ -675,20 +721,108 @@ async function connectAmazon(role) {
       showToast('Amazon Music conectado!', 'success');
       renderConnectForms();
       checkTransferReady();
+      return true;
     } else {
-      if (status) status.textContent = d.error || 'Falha ao conectar.';
-      showToast(d.error || 'Falha ao conectar Amazon Music', 'error');
+      const message = humanizePlatformError(d.error || 'Falha ao conectar Amazon Music');
+      if (status) status.textContent = message;
+      showToast(message, 'error');
+      return false;
     }
   } catch {
     if (status) status.textContent = 'Erro de rede.';
     showToast('Erro ao conectar Amazon Music', 'error');
+    return false;
   }
+}
+
+async function autoConnectSavedAccess(config) {
+  const key = `${config.platform}:${config.role}`;
+  const status = document.getElementById(config.statusId);
+  const btn = document.getElementById(`${config.role}-${config.platform}-auto-btn`);
+
+  state.platformAutoConnecting = state.platformAutoConnecting || {};
+  state.platformAutoConnecting[key] = true;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin-inline"></span> Conectando...';
+  }
+  if (status) {
+    status.innerHTML = `<span class="spin-inline"></span> Tentando conectar ${config.name} automaticamente...`;
+  }
+
+  const success = await config.connect(config.role);
+  state.platformAutoConnecting[key] = false;
+
+  if (success) {
+    return true;
+  }
+
+  if (config.detailsId) {
+    const details = document.getElementById(config.detailsId);
+    if (details) details.open = true;
+  }
+
+  const retryBtn = document.getElementById(`${config.role}-${config.platform}-auto-btn`);
+  if (retryBtn) {
+    retryBtn.disabled = false;
+    retryBtn.innerHTML = '🔌 Tentar novamente';
+  }
+  if (status && config.fallbackMessage) {
+    status.textContent = config.fallbackMessage;
+  }
+  return false;
+}
+
+function autoConnectSoundcloud(role) {
+  return autoConnectSavedAccess({
+    platform: 'soundcloud',
+    role,
+    name: 'SoundCloud',
+    statusId: `${role}-sc-status`,
+    detailsId: role === 'src' ? `${role}-soundcloud-private-details` : `${role}-soundcloud-token-details`,
+    connect: connectSoundcloud,
+    fallbackMessage: role === 'src'
+      ? 'Se a playlist for privada, cole o token da conta no modo manual abaixo.'
+      : 'Para salvar no SoundCloud, esta instalacao precisa de um token da conta de destino. Deixei o modo manual aberto abaixo.',
+  });
+}
+
+function autoConnectApple(role) {
+  return autoConnectSavedAccess({
+    platform: 'apple',
+    role,
+    name: 'Apple Music',
+    statusId: `${role}-apple-status`,
+    detailsId: role === 'src' ? '' : `${role}-apple-details`,
+    connect: connectApple,
+    fallbackMessage: role === 'src'
+      ? 'Apple Music pronta para ler playlists publicas pelo link.'
+      : 'Para salvar na Apple Music, esta instalacao precisa dos codigos MusicKit dessa conta. Deixei o modo manual aberto abaixo.',
+  });
+}
+
+function autoConnectAmazon(role) {
+  return autoConnectSavedAccess({
+    platform: 'amazon',
+    role,
+    name: 'Amazon Music',
+    statusId: `${role}-amazon-status`,
+    detailsId: `${role}-amazon-details`,
+    connect: connectAmazon,
+    fallbackMessage: 'Para usar Amazon Music, esta instalacao precisa de acesso oficial da API. Deixei o modo manual aberto abaixo.',
+  });
 }
 
 async function startTidalConnect(role) {
   state.tidalPending = state.tidalPending || {};
   const status = document.getElementById(`${role}-tidal-status`);
-  if (status) status.innerHTML = '<span class="spin-inline"></span> Gerando codigo do TIDAL...';
+  const btn = document.getElementById(`${role}-tidal-auto-btn`);
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin-inline"></span> Conectando...';
+  }
+  if (status) status.innerHTML = '<span class="spin-inline"></span> Abrindo o login oficial do TIDAL...';
   try {
     const r = await fetch('/api/connect/tidal/start', {
       method: 'POST',
@@ -697,25 +831,43 @@ async function startTidalConnect(role) {
     });
     const d = await r.json();
     if (!d.ok) {
-      if (status) status.textContent = d.error || 'Falha ao iniciar login.';
-      showToast(d.error || 'Falha ao iniciar login do TIDAL', 'error');
+      const message = humanizePlatformError(d.error || 'Falha ao iniciar login do TIDAL');
+      if (status) status.textContent = message;
+      showToast(message, 'error');
+      if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '🔌 Tentar novamente';
+      }
       return;
     }
 
     state.tidalPending[role] = d.login_id;
+    const loginUrl = d.verification_uri_complete || d.verification_uri || '';
+    let opened = null;
+    if (loginUrl) {
+      opened = window.open(loginUrl, '_blank', 'noopener');
+    }
     if (status) {
       status.innerHTML = `
         <div style="display:grid;gap:8px;">
-          <div>Codigo: <strong>${escapeHtml(d.user_code)}</strong></div>
-          <a href="${d.verification_uri_complete}" target="_blank" rel="noopener">Abrir login oficial do TIDAL</a>
+          <div>Abri o login oficial do TIDAL neste navegador.</div>
+          ${d.user_code ? `<div>Se o TIDAL pedir codigo, use <strong>${escapeHtml(d.user_code)}</strong>.</div>` : ''}
+          ${loginUrl ? `<a href="${loginUrl}" target="_blank" rel="noopener">Abrir login do TIDAL novamente</a>` : ''}
           <div>Assim que voce autorizar, esta tela conecta sozinha.</div>
         </div>
       `;
+    }
+    if (!opened && loginUrl) {
+      showToast('Nao consegui abrir a aba do TIDAL automaticamente. Use o link exibido para continuar.', 'warn');
     }
     pollTidalLogin(role, d.login_id);
   } catch {
     if (status) status.textContent = 'Erro de rede.';
     showToast('Erro ao iniciar login do TIDAL', 'error');
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '🔌 Tentar novamente';
+    }
   }
 }
 
@@ -746,10 +898,20 @@ async function pollTidalLogin(role, loginId) {
     state.tidalPending[role] = null;
     if (status) status.textContent = d.error || 'Falha ao conectar.';
     showToast(d.error || 'Falha ao conectar TIDAL', 'error');
+    const btn = document.getElementById(`${role}-tidal-auto-btn`);
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '🔌 Tentar novamente';
+    }
   } catch {
     state.tidalPending[role] = null;
     if (status) status.textContent = 'Erro de rede.';
     showToast('Erro ao conectar TIDAL', 'error');
+    const btn = document.getElementById(`${role}-tidal-auto-btn`);
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '🔌 Tentar novamente';
+    }
   }
 }
 
@@ -921,9 +1083,75 @@ function makeOAuthForm(platform, role) {
   });
 }
 
+function makeSpotifyQuickConnect(role) {
+  const connected = (role === 'src' && state.srcSid) || (role === 'dest' && state.destSid);
+  const displayName = role === 'src' ? state.srcDisplayName : state.destDisplayName;
+  const oauthConfigured = !!state.platforms.spotify?.oauth_configured;
+  const autoTrying = !!state.spotifyAutoConnecting?.[role];
+
+  if (connected && displayName) {
+    return makeConnectCallout({
+      platform: 'spotify',
+      tone: 'success',
+      badge: 'Conectado',
+      title: `Spotify conectado como ${displayName}`,
+      subtitle: 'Pronto para transferir playlists.',
+    });
+  }
+
+  const subtitle = oauthConfigured
+    ? 'Clique no botao abaixo. O app abre o login oficial do Spotify e termina a conexao sozinho.'
+    : 'Clique no botao abaixo. O app tenta encontrar seu login do Spotify automaticamente e, se precisar, abre uma janela guiada para concluir.';
+
+  const hint = oauthConfigured
+    ? 'Depois da autorizacao no Spotify, esta tela continua sozinha.'
+    : 'Se o Spotify ja estiver aberto e logado nesta maquina, o app tenta aproveitar isso sozinho. Se nao achar, abre uma janela segura de login.';
+
+  return makeFormPanel(`
+    <div class="manual-connect-header deezer-quick-header">
+      <div class="manual-connect-platform">
+        <div class="manual-connect-platform-icon">${PLATFORM_ICONS.spotify || ''}</div>
+        <div class="manual-connect-platform-copy">
+          <div class="manual-connect-title">Conectar Spotify</div>
+          <div class="manual-connect-subtitle">${subtitle}</div>
+        </div>
+      </div>
+    </div>
+    <div class="manual-connect-actions deezer-quick-actions">
+      <button class="btn btn-primary btn-sm deezer-auto-connect-btn" type="button" id="${role}-spotify-auto-btn" onclick="autoConnectSpotify('${role}')" ${autoTrying ? 'disabled' : ''}>
+        ${autoTrying ? '<span class="spin-inline"></span> Conectando...' : '🔌 Conectar Spotify automaticamente'}
+      </button>
+    </div>
+    <div class="deezer-quick-hint" id="${role}-spotify-hint">${hint}</div>
+    ${makeInlineStatus(`${role}-spotify-status`)}
+  `);
+}
+
+function makeAutomaticConnectPanel(config) {
+  const autoTrying = !!state.platformAutoConnecting?.[`${config.platform}:${config.role}`] || !!config.autoTrying;
+  return makeFormPanel(`
+    <div class="manual-connect-header deezer-quick-header">
+      <div class="manual-connect-platform">
+        <div class="manual-connect-platform-icon">${PLATFORM_ICONS[config.platform] || ''}</div>
+        <div class="manual-connect-platform-copy">
+          <div class="manual-connect-title">${config.title}</div>
+          <div class="manual-connect-subtitle">${config.subtitle}</div>
+        </div>
+      </div>
+    </div>
+    <div class="manual-connect-actions deezer-quick-actions">
+      <button class="btn btn-primary btn-sm deezer-auto-connect-btn" type="button" id="${config.role}-${config.platform}-auto-btn" onclick="${config.action}" ${autoTrying ? 'disabled' : ''}>
+        ${autoTrying ? '<span class="spin-inline"></span> Conectando...' : config.buttonLabel}
+      </button>
+    </div>
+    <div class="deezer-quick-hint" id="${config.role}-${config.platform}-hint">${config.hint || ''}</div>
+    ${makeInlineStatus(config.statusId)}
+  `);
+}
+
 function makeSpotifyForm(role) {
   const wrapper = document.createElement('div');
-  if (state.platforms.spotify?.oauth_configured) {
+  if (role === 'src' && state.platforms.spotify?.oauth_configured) {
     wrapper.appendChild(makeOAuthForm('spotify', role));
     wrapper.appendChild(makeAdvancedDetails(
       'Estou com problema no login rapido',
@@ -963,7 +1191,10 @@ function makeSpotifyForm(role) {
         ],
       })
     ));
-  } else if (role === 'src') {
+    return wrapper;
+  }
+
+  if (role === 'src') {
     wrapper.appendChild(makeConnectCallout({
       platform: 'spotify',
       tone: 'success',
@@ -972,16 +1203,52 @@ function makeSpotifyForm(role) {
       subtitle: 'Para playlists publicas menores, voce nao precisa entrar nem copiar nada.',
       note: 'Playlists privadas ou maiores ainda nao estao disponiveis completas nesta instalacao.',
     }));
-  } else {
-    wrapper.appendChild(makeConnectCallout({
-      platform: 'spotify',
-      tone: 'warning',
-      badge: 'Indisponivel aqui',
-      title: 'Spotify como destino ainda nao esta pronto neste site',
-      subtitle: 'Para salvar playlists no Spotify, esta instalacao ainda precisa ativar o login oficial.',
-      note: 'Para o usuario final, essa etapa vai aparecer so como botao de login quando o site estiver pronto.',
-    }));
+    return wrapper;
   }
+
+  wrapper.appendChild(makeSpotifyQuickConnect(role));
+
+  wrapper.appendChild(makeAdvancedDetails(
+    'Nao funcionou? Fazer manualmente',
+    makeManualCredentialsForm({
+      platform: 'spotify',
+      role,
+      title: 'Copie o valor do Spotify',
+      subtitle: state.platforms.spotify?.oauth_configured
+        ? 'Use isso so se o automatico nao abrir ou nao terminar.'
+        : 'Use isso so se a captura automatica nao conseguir terminar nesta instalacao.',
+      badges: ['Sem senha aqui', 'Copie 1 valor', 'Cole e siga'],
+      notice: {
+        title: 'Onde clicar',
+        body: 'No Spotify Web, abra <strong>F12</strong> e depois <strong>Application &gt; Cookies &gt; https://open.spotify.com</strong>.',
+      },
+      label: 'Cole aqui o valor copiado ou o cabecalho Cookie completo',
+      inputId: `${role}-spotify-cookie`,
+      placeholder: 'Cole o Cookie Value de sp_dc ou o cabecalho Cookie completo',
+      statusId: `${role}-spotify-status`,
+      action: 'connectSpotify',
+      buttonLabel: 'Conectar Spotify',
+      help: state.platforms.spotify?.oauth_configured
+        ? 'Se o automatico funcionar, voce pode ignorar esta parte.'
+        : 'Se preferir, pode colar so o Cookie Value de sp_dc.',
+      steps: [
+        {
+          title: 'Abra o Spotify Web',
+          detail: 'Entre na conta certa e deixe a pagina aberta.',
+        },
+        {
+          title: 'Abra os dados do site',
+          detail: 'Pressione <kbd>F12</kbd> e clique em <strong>Application</strong> ou <strong>Armazenamento</strong>. Depois entre em <strong>Cookies</strong> e escolha <code>https://open.spotify.com</code>.',
+        },
+        {
+          title: 'Copie o valor certo',
+          detail: 'Clique em <code>sp_dc</code> e copie o texto que aparece em <strong>Cookie Value</strong>.',
+          hint: 'Se ficar mais facil, voce tambem pode colar o cabecalho completo <code>Cookie</code> de uma requisicao do Spotify Web.',
+        },
+      ],
+    }),
+    false
+  ));
 
   return wrapper;
 }
@@ -1072,6 +1339,95 @@ function makeDeezerQuickConnect(role) {
   `);
 }
 
+function makeYoutubeManualPanel(role, subtitle, footnote = '') {
+  const youtubeManualLabel = 'Cole aqui o cURL completo que voce copiou';
+  const youtubeManualPlaceholder = 'Cole aqui o texto inteiro de "Copy as cURL (bash)"';
+  const youtubeManualHelp = 'Cole o comando cURL inteiro. Nao copie texto das abas Payload, Preview, Response nem pedacos soltos de Headers.';
+
+  return makeManualCredentialsForm({
+    platform: 'youtube',
+    role,
+    title: 'Conectar manualmente pelo navegador',
+    subtitle,
+    badges: ['Sem senha aqui', 'Copie 1 vez', 'Cole o texto inteiro'],
+    notice: {
+      tone: 'warning',
+      title: 'Importante',
+      body: 'Clique com o botao direito na <strong>linha browse</strong> e copie o <strong>cURL completo</strong>. Nao copie o conteudo interno de <strong>Payload</strong>, <strong>Preview</strong> ou <strong>Response</strong>.',
+    },
+    label: youtubeManualLabel,
+    inputId: `${role}-ytm-curl`,
+    placeholder: youtubeManualPlaceholder,
+    statusId: `${role}-ytm-status`,
+    action: 'connectYoutube',
+    buttonLabel: 'Conectar YouTube Music',
+    secondaryButtonLabel: 'Usar o que copiei',
+    secondaryButtonAction: `pasteYoutubeFromClipboard('${role}')`,
+    help: youtubeManualHelp,
+    footnote,
+    steps: [
+      {
+        title: 'Abra o YouTube Music',
+        detail: 'Entre na conta que vai receber a playlist e deixe a pagina inicial aberta.',
+      },
+      {
+        title: 'Abra a aba certa do navegador',
+        detail: 'Pressione <kbd>F12</kbd>, clique em <strong>Network</strong> e depois atualize a pagina com <kbd>F5</kbd>.',
+      },
+      {
+        title: 'Ache a linha browse',
+        detail: 'Na lista que apareceu, encontre a linha <code>browse</code>. Se precisar, use o filtro e digite <code>browse</code>.',
+      },
+      {
+        title: 'Copie do jeito certo',
+        detail: 'Clique com o botao direito na <strong>linha browse</strong> e escolha <strong>Copy &gt; Copy as cURL (bash)</strong>.',
+        hint: 'Nao copie o que aparece dentro de <strong>Payload</strong>, <strong>Preview</strong> ou <strong>Response</strong>.',
+      },
+    ],
+  });
+}
+
+function makeYoutubeQuickConnect(role) {
+  const pending = state.youtubePending?.[role];
+  const autoTrying = !!pending || !!state.youtubeAutoConnecting?.[role];
+  const oauthConfigured = !!state.platforms.youtube?.oauth_configured;
+
+  let subtitle = oauthConfigured
+    ? 'Clique no botao abaixo. O app abre o login oficial do Google e tenta concluir sozinho.'
+    : 'Clique no botao abaixo. O app tenta usar o que ja tiver disponivel e, se precisar, abre uma janela guiada para concluir o login.';
+
+  let hint = oauthConfigured
+    ? 'Depois da autorizacao no Google, esta tela continua sozinha.'
+    : 'Se voce ja tiver algo valido copiado do navegador, o app aproveita. Se nao, ele abre uma janela guiada do YouTube Music e tenta terminar tudo sozinho.';
+
+  if (pending?.mode === 'oauth') {
+    hint = pending.userCode
+      ? `Termine a autorizacao na aba do Google. Se pedirem um codigo, use ${pending.userCode}.`
+      : 'Termine a autorizacao na aba do Google. Esta tela continua sozinha depois.';
+  } else if (pending?.mode === 'guided') {
+    hint = 'Uma janela guiada do YouTube Music deve estar aberta agora. Entre nela e o app tenta concluir sozinho.';
+  }
+
+  return makeFormPanel(`
+    <div class="manual-connect-header deezer-quick-header">
+      <div class="manual-connect-platform">
+        <div class="manual-connect-platform-icon">${PLATFORM_ICONS.youtube || ''}</div>
+        <div class="manual-connect-platform-copy">
+          <div class="manual-connect-title">Conectar YouTube Music</div>
+          <div class="manual-connect-subtitle">${subtitle}</div>
+        </div>
+      </div>
+    </div>
+    <div class="manual-connect-actions deezer-quick-actions">
+      <button class="btn btn-primary btn-sm deezer-auto-connect-btn" type="button" id="${role}-ytm-auto-btn" onclick="autoConnectYoutube('${role}')" ${autoTrying ? 'disabled' : ''}>
+        ${autoTrying ? '<span class="spin-inline"></span> Conectando...' : '🔌 Conectar YouTube Music automaticamente'}
+      </button>
+    </div>
+    <div class="deezer-quick-hint" id="${role}-ytm-hint">${hint}</div>
+    ${makeInlineStatus(`${role}-ytm-status`)}
+  `);
+}
+
 function makeYoutubeForm(role) {
   if (role === 'src') {
     return makeConnectCallout({
@@ -1085,223 +1441,81 @@ function makeYoutubeForm(role) {
   }
 
   const wrapper = document.createElement('div');
-  const pending = state.youtubePending?.[role];
-  const oauthConfigured = !!state.platforms.youtube?.oauth_configured;
-  const youtubeManualLabel = 'Cole aqui o cURL completo que voce copiou';
-  const youtubeManualPlaceholder = 'Cole aqui o texto inteiro de "Copy as cURL (bash)"';
-  const youtubeManualHelp = 'Cole o comando cURL inteiro. Nao copie texto das abas Payload, Preview, Response nem pedacos soltos de Headers.';
-  const youtubeManualSteps = [
-    {
-      title: 'Abra o YouTube Music',
-      detail: 'Entre na conta que vai receber a playlist e deixe a pagina inicial aberta.',
-    },
-    {
-      title: 'Abra a aba certa do navegador',
-      detail: 'Pressione <kbd>F12</kbd>, clique em <strong>Network</strong> e depois atualize a pagina com <kbd>F5</kbd>.',
-    },
-    {
-      title: 'Ache a linha browse',
-      detail: 'Na lista que apareceu, encontre a linha <code>browse</code>. Se precisar, use o filtro e digite <code>browse</code>.',
-    },
-    {
-      title: 'Copie do jeito certo',
-      detail: 'Clique com o botao direito na <strong>linha browse</strong> e escolha <strong>Copy &gt; Copy as cURL (bash)</strong>.',
-      hint: 'Nao copie o que aparece dentro de <strong>Payload</strong>, <strong>Preview</strong> ou <strong>Response</strong>.',
-    },
-  ];
-
-  if (pending?.loginId) {
-    wrapper.appendChild(makeConnectCallout({
-      platform: 'youtube',
-      tone: 'success',
-      badge: 'Aguardando Google',
-      title: 'Termine o login nessa nova aba',
-      subtitle: 'Abri uma aba do Google neste mesmo navegador. Autorize a conta que vai receber a playlist e esta tela tenta concluir sozinha.',
-      note: pending.userCode
-        ? `Se o Google pedir um codigo, use <strong>${escapeHtml(pending.userCode)}</strong>.`
-        : 'Se a aba nao abriu, toque em "Abrir aba de novo".',
-      buttonLabel: 'Tentar agora',
-      buttonAction: `finishYoutubeAutoConnect('${role}')`,
-      buttonClass: 'btn btn-primary',
-    }));
-    wrapper.appendChild(makeFormPanel(`
-      <div class="manual-connect-actions">
-        <button class="btn btn-ghost btn-sm" type="button" onclick="reopenYoutubeOAuthTab('${role}')">
-          Abrir aba de novo
-        </button>
-      </div>
-      ${makeInlineStatus(`${role}-ytm-status`)}
-    `));
-    wrapper.appendChild(makeAdvancedDetails(
-      'Nao funcionou? Fazer do jeito manual',
-      makeManualCredentialsForm({
-        platform: 'youtube',
-        role,
-        title: 'Conectar manualmente pelo navegador',
-        subtitle: 'Use isso so se a janela guiada nao der certo.',
-        badges: ['Sem senha aqui', 'Copie 1 vez', 'Cole o texto inteiro'],
-        notice: {
-          tone: 'warning',
-          title: 'Importante',
-          body: 'O app precisa do <strong>cURL completo</strong> da linha <code>browse</code>. Nao abra as abas <strong>Payload</strong>, <strong>Preview</strong> ou <strong>Response</strong> para copiar de la.',
-        },
-        label: youtubeManualLabel,
-        inputId: `${role}-ytm-curl`,
-        placeholder: youtubeManualPlaceholder,
-        statusId: `${role}-ytm-status`,
-        action: 'connectYoutube',
-        buttonLabel: 'Conectar YouTube Music',
-        secondaryButtonLabel: 'Usar o que copiei',
-        secondaryButtonAction: `pasteYoutubeFromClipboard('${role}')`,
-        help: youtubeManualHelp,
-        steps: youtubeManualSteps,
-      }),
-      false
-    ));
-    return wrapper;
-  }
-
-  if (oauthConfigured) {
-    wrapper.appendChild(makeConnectCallout({
-      platform: 'youtube',
-      tone: 'warning',
-      badge: 'Login oficial',
-      title: 'Entrar com Google',
-      subtitle: 'Clique abaixo para abrir uma nova aba neste mesmo navegador e autorizar o YouTube Music.',
-      note: 'Sua senha continua no Google. Quando a autorizacao terminar, esta tela conecta sozinha.',
-      buttonLabel: 'Continuar com Google',
-      buttonAction: `startYoutubeAutoConnect('${role}')`,
-      buttonClass: 'btn btn-primary',
-    }));
-    wrapper.appendChild(makeFormPanel(makeInlineStatus(`${role}-ytm-status`)));
-  } else {
-    wrapper.appendChild(makeConnectCallout({
-      platform: 'youtube',
-      tone: 'warning',
-      badge: 'Modo de teste',
-      title: 'Esta instalacao ainda nao ativou o login oficial do Google',
-      subtitle: 'Entao, por enquanto, o jeito que funciona para testar e o modo manual logo abaixo.',
-      note: 'Nao vou esconder isso em uma dobra: como nao existe 1 clique aqui, o passo manual aparece aberto logo abaixo.',
-    }));
-    wrapper.appendChild(makeManualCredentialsForm({
-      platform: 'youtube',
+  const manualDetails = makeAdvancedDetails(
+    'Nao funcionou? Fazer manualmente',
+    makeYoutubeManualPanel(
       role,
-      title: 'Conectar manualmente pelo navegador',
-      subtitle: 'Use este passo nesta instalacao enquanto o login oficial do Google nao estiver configurado.',
-      badges: ['Sem senha aqui', 'Copie 1 vez', 'Cole o texto inteiro'],
-      notice: {
-        tone: 'warning',
-        title: 'Importante',
-        body: 'Clique com o botao direito na <strong>linha browse</strong> e copie o <strong>cURL completo</strong>. Nao copie o conteudo interno de <strong>Payload</strong>, <strong>Preview</strong> ou <strong>Response</strong>.',
-      },
-      label: youtubeManualLabel,
-      inputId: `${role}-ytm-curl`,
-      placeholder: youtubeManualPlaceholder,
-      statusId: `${role}-ytm-status`,
-      action: 'connectYoutube',
-      buttonLabel: 'Conectar YouTube Music',
-      secondaryButtonLabel: 'Usar o que copiei',
-      secondaryButtonAction: `pasteYoutubeFromClipboard('${role}')`,
-      help: youtubeManualHelp,
-      footnote: 'Quando o login oficial do Google for ativado nesta instalacao, este passo manual deixa de ser o caminho principal.',
-      steps: [
-        {
-          title: 'Abra o YouTube Music',
-          detail: 'Entre na conta que vai receber a playlist e deixe a pagina inicial aberta.',
-        },
-        ...youtubeManualSteps.slice(1),
-      ],
-    }));
-    return wrapper;
-  }
-
-  wrapper.appendChild(makeAdvancedDetails(
-    'Prefiro fazer do jeito manual',
-    makeManualCredentialsForm({
-      platform: 'youtube',
-      role,
-      title: 'Conectar manualmente pelo navegador',
-      subtitle: 'Use isso so se a conexao automatica nao abrir direito.',
-      badges: ['Sem senha aqui', 'Copie 1 vez', 'Cole o texto inteiro'],
-      notice: {
-        tone: 'warning',
-        title: 'Importante',
-        body: 'O que voce deve copiar e o <strong>cURL completo</strong> da linha <code>browse</code>. Nao copie texto de <strong>Payload</strong>, <strong>Preview</strong> ou <strong>Response</strong>.',
-      },
-      label: youtubeManualLabel,
-      inputId: `${role}-ytm-curl`,
-      placeholder: youtubeManualPlaceholder,
-      statusId: `${role}-ytm-status`,
-      action: 'connectYoutube',
-      buttonLabel: 'Conectar YouTube Music',
-      secondaryButtonLabel: 'Usar o que copiei',
-      secondaryButtonAction: `pasteYoutubeFromClipboard('${role}')`,
-      help: youtubeManualHelp,
-      footnote: 'Se o automatico funcionar, voce pode ignorar esta parte.',
-      steps: youtubeManualSteps,
-    }),
+      state.platforms.youtube?.oauth_configured
+        ? 'Use isso so se o automatico nao abrir ou nao terminar.'
+        : 'Use isso so se a janela guiada nao der certo nesta instalacao.',
+      state.platforms.youtube?.oauth_configured
+        ? 'Se o automatico funcionar, voce pode ignorar esta parte.'
+        : 'Quando o login oficial do Google for ativado nesta instalacao, este passo manual deixa de ser o caminho principal.'
+    ),
     false
-  ));
+  );
+  manualDetails.id = `${role}-youtube-manual-details`;
+
+  wrapper.appendChild(makeYoutubeQuickConnect(role));
+  wrapper.appendChild(manualDetails);
   return wrapper;
 }
 
 function makeSoundcloudForm(role) {
   const wrapper = document.createElement('div');
+  const detailsId = role === 'src' ? `${role}-soundcloud-private-details` : `${role}-soundcloud-token-details`;
 
   if (role === 'src') {
-    wrapper.appendChild(makeConnectCallout({
-      platform: 'soundcloud',
-      tone: 'success',
-      badge: 'Sem login',
-      title: 'Nao precisa entrar no SoundCloud agora',
-      subtitle: 'Playlists publicas funcionam so com o link.',
-      note: 'Se a playlist for privada, voce pode usar um token nas opcoes avancadas.',
-    }));
-    wrapper.appendChild(makeAdvancedDetails(
-      'Minha playlist e privada',
-    makeManualCredentialsForm({
-      platform: 'soundcloud',
-      role,
-      title: 'Token opcional do SoundCloud',
-      subtitle: 'Use isso so se a playlist nao for publica.',
-      badges: ['Opcional', 'So para playlist privada'],
-      label: 'Cole aqui o access token do SoundCloud',
-      inputId: `${role}-soundcloud-token`,
-      placeholder: 'access_token...',
+    const privateDetails = makeAdvancedDetails(
+      'Nao funcionou? Fazer manualmente',
+      makeManualCredentialsForm({
+        platform: 'soundcloud',
+        role,
+        title: 'Token opcional do SoundCloud',
+        subtitle: 'Use isso so se a playlist nao for publica.',
+        badges: ['Opcional', 'So para playlist privada'],
+        label: 'Cole aqui o access token do SoundCloud',
+        inputId: `${role}-soundcloud-token`,
+        placeholder: 'access_token...',
         statusId: `${role}-sc-status`,
         action: 'connectSoundcloud',
-      buttonLabel: 'Usar token do SoundCloud',
-      help: 'Se a playlist for publica, voce pode ignorar esta parte.',
-      steps: [
-        {
-          title: 'Veja se voce realmente precisa disso',
-          detail: 'Para playlist publica, pode ignorar esta parte. So use token se a playlist for privada.',
-        },
-        {
-          title: 'Copie o token da conta certa',
-          detail: 'Use um access token OAuth valido da conta do SoundCloud que pode ler essa playlist.',
-        },
-        {
-          title: 'Cole e confirme',
-          detail: 'Cole o token no campo abaixo para liberar o acesso privado.',
-        },
-      ],
-    }),
+        buttonLabel: 'Usar token do SoundCloud',
+        help: 'Se a playlist for publica, voce pode ignorar esta parte.',
+        steps: [
+          {
+            title: 'Veja se voce realmente precisa disso',
+            detail: 'Para playlist publica, pode ignorar esta parte. So use token se a playlist for privada.',
+          },
+          {
+            title: 'Copie o token da conta certa',
+            detail: 'Use um access token OAuth valido da conta do SoundCloud que pode ler essa playlist.',
+          },
+          {
+            title: 'Cole e confirme',
+            detail: 'Cole o token no campo abaixo para liberar o acesso privado.',
+          },
+        ],
+      }),
       false
-    ));
+    );
+    privateDetails.id = detailsId;
+
+    wrapper.appendChild(makeAutomaticConnectPanel({
+      platform: 'soundcloud',
+      role,
+      title: 'Conectar SoundCloud',
+      subtitle: 'Clique no botao abaixo. Para playlists publicas, o app prepara tudo sozinho.',
+      hint: 'Se a playlist for privada, o app avisa e deixa o modo manual logo abaixo.',
+      statusId: `${role}-sc-status`,
+      buttonLabel: '🔌 Conectar SoundCloud automaticamente',
+      action: `autoConnectSoundcloud('${role}')`,
+    }));
+    wrapper.appendChild(privateDetails);
     return wrapper;
   }
 
-  wrapper.appendChild(makeConnectCallout({
-    platform: 'soundcloud',
-    tone: 'warning',
-    badge: 'Avancado',
-    title: 'Conectar SoundCloud',
-    subtitle: 'Para criar playlists no SoundCloud, esta plataforma ainda pede um token.',
-    note: 'Se voce nao tiver esse token, talvez seja mais facil escolher outro destino.',
-  }));
-  wrapper.appendChild(makeAdvancedDetails(
-    'Tenho um token do SoundCloud',
+  const tokenDetails = makeAdvancedDetails(
+    'Abrir token do SoundCloud',
     makeManualCredentialsForm({
       platform: 'soundcloud',
       role,
@@ -1330,8 +1544,21 @@ function makeSoundcloudForm(role) {
         },
       ],
     }),
-    true
-  ));
+    false
+  );
+  tokenDetails.id = detailsId;
+
+  wrapper.appendChild(makeAutomaticConnectPanel({
+    platform: 'soundcloud',
+    role,
+    title: 'Conectar SoundCloud',
+    subtitle: 'Clique no botao abaixo. Se esta instalacao ja tiver acesso salvo, o app conecta em um passo.',
+    hint: 'Se faltar autorizacao do SoundCloud, o app abre o fallback manual sem tirar voce da tela.',
+    statusId: `${role}-sc-status`,
+    buttonLabel: '🔌 Conectar SoundCloud automaticamente',
+    action: `autoConnectSoundcloud('${role}')`,
+  }));
+  wrapper.appendChild(tokenDetails);
   return wrapper;
 }
 
@@ -1339,32 +1566,25 @@ function makeAppleForm(role) {
   const wrapper = document.createElement('div');
 
   if (role === 'src') {
-    wrapper.appendChild(makeConnectCallout({
+    wrapper.appendChild(makeAutomaticConnectPanel({
       platform: 'apple',
-      tone: 'success',
-      badge: 'Sem login',
-      title: 'Nao precisa entrar na Apple Music agora',
-      subtitle: 'Playlists publicas da Apple Music podem ser lidas so com o link.',
-      note: 'Basta colar o link da playlist abaixo.',
+      role,
+      title: 'Conectar Apple Music',
+      subtitle: 'Clique no botao abaixo. Para playlists publicas, o app prepara a leitura automaticamente.',
+      hint: 'Se o link for publico, voce nao precisa colocar codigo nenhum.',
+      statusId: `${role}-apple-status`,
+      buttonLabel: '🔌 Conectar Apple Music automaticamente',
+      action: `autoConnectApple('${role}')`,
     }));
     return wrapper;
   }
 
-  wrapper.appendChild(makeConnectCallout({
-    platform: 'apple',
-    tone: 'warning',
-    badge: 'Avancado',
-    title: 'Conectar Apple Music',
-    subtitle: 'Hoje a Apple ainda exige dois tokens tecnicos para criar playlists por aqui.',
-    note: 'Use esta opcao apenas se voce ja tiver esses tokens em maos.',
-  }));
-
-  wrapper.appendChild(makeAdvancedDetails(
-    'Tenho os tokens da Apple Music',
+  const appleDetails = makeAdvancedDetails(
+    'Nao funcionou? Fazer manualmente',
     makeFormPanel(`
       <div class="manual-connect-header">
-        <div class="manual-connect-title">Tokens da Apple Music</div>
-        <div class="manual-connect-subtitle">Preencha apenas se voce ja usa MusicKit ou ja recebeu esses dados.</div>
+        <div class="manual-connect-title">Dados da Apple Music</div>
+        <div class="manual-connect-subtitle">Preencha apenas se voce ja usa MusicKit ou ja recebeu esses codigos.</div>
       </div>
       ${makeTextAreaField(`${role}-apple-developer-token`, 'Developer token', 'eyJhbGciOi...')}
       ${makeTextAreaField(`${role}-apple-user-token`, 'Music user token', 'music-user-token...')}
@@ -1372,59 +1592,75 @@ function makeAppleForm(role) {
       <button class="btn btn-secondary btn-sm" onclick="connectApple('${role}')">Conectar Apple Music</button>
       ${makeInlineStatus(`${role}-apple-status`)}
     `),
-    true
-  ));
+    false
+  );
+  appleDetails.id = `${role}-apple-details`;
+
+  wrapper.appendChild(makeAutomaticConnectPanel({
+    platform: 'apple',
+    title: 'Conectar Apple Music',
+    role,
+    subtitle: 'Clique no botao abaixo. Se esta instalacao ja tiver MusicKit salvo, o app conecta em um passo.',
+    hint: 'Se faltar autorizacao da Apple, o app mostra o fallback manual sem poluir o fluxo principal.',
+    statusId: `${role}-apple-status`,
+    buttonLabel: '🔌 Conectar Apple Music automaticamente',
+    action: `autoConnectApple('${role}')`,
+  }));
+  wrapper.appendChild(appleDetails);
 
   return wrapper;
 }
 
 function makeAmazonForm(role) {
   const wrapper = document.createElement('div');
-  wrapper.appendChild(makeConnectCallout({
-    platform: 'amazon',
-    tone: 'warning',
-    badge: 'Limitado',
-    title: 'Conectar Amazon Music',
-    subtitle: 'A Amazon Music Web API ainda e uma opcao avancada e nem sempre esta liberada para todo mundo.',
-    note: 'Se quiser seguir, abra as opcoes avancadas abaixo.',
-  }));
-
-  wrapper.appendChild(makeAdvancedDetails(
-    'Tenho API key e access token',
+  const amazonDetails = makeAdvancedDetails(
+    'Nao funcionou? Fazer manualmente',
     makeFormPanel(`
       <div class="manual-connect-header">
         <div class="manual-connect-title">Amazon Music Web API</div>
         <div class="manual-connect-subtitle">Preencha isso apenas se voce ja recebeu acesso oficial a API.</div>
       </div>
-      ${makeTextInputField(`${role}-amazon-api-key`, 'API key', 'amzn1.application-oa2-client...')}
-      ${makeTextAreaField(`${role}-amazon-access-token`, 'Access token', 'Atza|IwEB...')}
+      ${makeTextInputField(`${role}-amazon-api-key`, 'Chave do app (API key)', 'amzn1.application-oa2-client...')}
+      ${makeTextAreaField(`${role}-amazon-access-token`, 'Token da conta (access token)', 'Atza|IwEB...')}
       ${makeTextInputField(`${role}-amazon-country-code`, 'Pais da conta', 'US', 'US')}
       <button class="btn btn-secondary btn-sm" onclick="connectAmazon('${role}')">Conectar Amazon Music</button>
       ${makeInlineStatus(`${role}-amazon-status`)}
     `),
     false
-  ));
+  );
+  amazonDetails.id = `${role}-amazon-details`;
+
+  wrapper.appendChild(makeAutomaticConnectPanel({
+    platform: 'amazon',
+    title: 'Conectar Amazon Music',
+    role,
+    subtitle: 'Clique no botao abaixo. Se esta instalacao ja tiver acesso da Amazon salvo, o app conecta em um passo.',
+    hint: 'Se a API da Amazon ainda nao estiver liberada para esta instalacao, o app avisa e deixa o fallback manual escondido abaixo.',
+    statusId: `${role}-amazon-status`,
+    buttonLabel: '🔌 Conectar Amazon Music automaticamente',
+    action: `autoConnectAmazon('${role}')`,
+  }));
+  wrapper.appendChild(amazonDetails);
 
   return wrapper;
 }
 
 function makeTidalForm(role) {
   const div = document.createElement('div');
-  div.appendChild(makeConnectCallout({
+  const pending = !!state.tidalPending?.[role];
+  div.appendChild(makeAutomaticConnectPanel({
     platform: 'tidal',
-    badge: 'Recomendado',
-    title: 'Entrar com TIDAL',
-    subtitle: 'O TIDAL abre o login oficial e esta tela acompanha tudo sozinha.',
-    note: 'Depois de autorizar, a conta aparece conectada aqui automaticamente.',
-    buttonLabel: 'Continuar com TIDAL',
-    buttonAction: `startTidalConnect('${role}')`,
-    buttonClass: 'btn btn-primary',
+    role,
+    title: 'Conectar TIDAL',
+    subtitle: 'Clique no botao abaixo. O TIDAL abre o login oficial e esta tela acompanha tudo sozinha.',
+    hint: pending
+      ? 'Termine a autorizacao no TIDAL. Assim que der certo, esta tela continua sozinha.'
+      : 'Depois de autorizar, a conta aparece conectada aqui automaticamente.',
+    statusId: `${role}-tidal-status`,
+    buttonLabel: '🔌 Conectar TIDAL automaticamente',
+    action: `startTidalConnect('${role}')`,
+    autoTrying: pending,
   }));
-
-  const status = document.createElement('div');
-  status.id = `${role}-tidal-status`;
-  status.className = 'connect-inline-status';
-  div.appendChild(status);
   return div;
 }
 
@@ -1642,11 +1878,11 @@ async function autoConnectDeezer(role) {
     status.innerHTML = '<span class="spin-inline"></span> Uma janela limpa de login do Deezer vai abrir na sua tela principal...';
   }
   if (hint) {
-    hint.textContent = 'Faca o login na janela que acabou de abrir. Ela fechara sozinha quando der certo.';
+    hint.textContent = 'Uma janela de login do Deezer deve abrir agora. Se ela aparecer atras, traga "Login Deezer - PlayTransfer" para frente e faca o login nela.';
   }
 
   if (status) {
-    status.innerHTML = '<span class="spin-inline"></span> Capturando o login do Deezer...';
+    status.innerHTML = '<span class="spin-inline"></span> Tentando abrir a janela de login do Deezer...';
   }
 
   // Inicia automação Chrome e monitora resultado
@@ -1685,6 +1921,10 @@ async function pollDeezerAutoConnect(role, attempt) {
     const r = await fetch(`/api/connect/deezer/browser-guided/status?role=${encodeURIComponent(role)}`);
     const d = await r.json();
 
+    if (d.status === 'pending' && status) {
+      status.innerHTML = '<span class="spin-inline"></span> Aguardando voce concluir o login na janela "Login Deezer - PlayTransfer"...';
+    }
+
     if (d.status === 'captured' && d.arl) {
       if (input) input.value = d.arl;
       if (status) {
@@ -1720,7 +1960,7 @@ async function pollDeezerAutoConnect(role, attempt) {
     return;
   }
 
-  if (attempt >= 18) {
+  if (attempt >= 140) {
     if (status) status.textContent = 'A captura demorou demais. Tente de novo ou use o modo manual abaixo.';
     try { window.focus(); } catch {}
     resetDeezerAutoBtn(role);
@@ -1845,7 +2085,7 @@ async function connectYoutube(role) {
 
   if (!headers) {
     showToast('Copie o texto do navegador no YouTube Music e toque em "Usar o que copiei" ou cole manualmente aqui.', 'warn');
-    return;
+    return false;
   }
 
   if (status) status.innerHTML = '<span class="spin-inline"></span> Confirmando acesso...';
@@ -1866,18 +2106,97 @@ async function connectYoutube(role) {
         state.destSid = d.sid;
         state.destDisplayName = d.display_name;
       }
+      state.youtubePending[role] = null;
+      state.youtubeAutoConnecting[role] = false;
       showToast('YouTube Music conectado!', 'success');
       renderConnectForms();
       checkTransferReady();
-      return;
+      return true;
     }
 
     const message = humanizePlatformError(d.error || 'Falha ao conectar YouTube Music');
     if (status) status.textContent = message;
     showToast(message, 'error');
+    return false;
   } catch {
     if (status) status.textContent = 'Erro de rede.';
     showToast('Erro ao conectar YouTube Music', 'error');
+    return false;
+  }
+}
+
+function looksLikeYoutubeBrowserText(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return false;
+  const lowered = raw.toLowerCase();
+  return (
+    lowered.startsWith('curl ') ||
+    lowered.includes('music.youtube.com') ||
+    lowered.includes('youtubei/v1/browse') ||
+    lowered.includes('__secure-3papisid') ||
+    lowered.includes('cookie:') ||
+    lowered.includes('x-goog-authuser')
+  );
+}
+
+function resetYoutubeAutoBtn(role) {
+  state.youtubeAutoConnecting = state.youtubeAutoConnecting || {};
+  state.youtubeAutoConnecting[role] = false;
+  const btn = document.getElementById(`${role}-ytm-auto-btn`);
+  if (btn) {
+    btn.disabled = false;
+    btn.innerHTML = '🔌 Conectar YouTube Music automaticamente';
+  }
+}
+
+async function autoConnectYoutube(role) {
+  state.youtubeAutoConnecting = state.youtubeAutoConnecting || {};
+  state.youtubeAutoConnecting[role] = true;
+
+  const status = document.getElementById(`${role}-ytm-status`);
+  const btn = document.getElementById(`${role}-ytm-auto-btn`);
+  const input = document.getElementById(`${role}-ytm-curl`);
+
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin-inline"></span> Conectando...';
+  }
+
+  if (status) {
+    status.innerHTML = '<span class="spin-inline"></span> Tentando confirmar o YouTube Music automaticamente...';
+  }
+
+  try {
+    if (navigator.clipboard?.readText) {
+      try {
+        const clipboardText = String((await navigator.clipboard.readText()) || '').trim();
+        if (looksLikeYoutubeBrowserText(clipboardText)) {
+          if (input) input.value = clipboardText;
+          if (status) {
+            status.innerHTML = '<span class="spin-inline"></span> Encontrei dados do YouTube Music no que voce copiou. Confirmando...';
+          }
+          const success = await connectYoutube(role);
+          if (success) {
+            state.youtubeAutoConnecting[role] = false;
+            return;
+          }
+        }
+      } catch {
+        // Se o navegador bloquear clipboard, seguimos para o proximo modo automatico.
+      }
+    }
+
+    if (state.platforms.youtube?.oauth_configured) {
+      await startYoutubeAutoConnect(role);
+      return;
+    }
+
+    await startYoutubeGuidedConnect(role);
+  } catch (error) {
+    const message = humanizePlatformError(error?.message || 'Falha ao abrir o YouTube Music automaticamente');
+    if (status) status.textContent = message;
+    showToast(message, 'error');
+    resetYoutubeAutoBtn(role);
   }
 }
 
@@ -1902,6 +2221,7 @@ async function startYoutubeAutoConnect(role) {
         state.destDisplayName = d.display_name;
       }
       state.youtubePending[role] = null;
+      state.youtubeAutoConnecting[role] = false;
       showToast('YouTube Music conectado!', 'success');
       renderConnectForms();
       checkTransferReady();
@@ -1919,11 +2239,13 @@ async function startYoutubeAutoConnect(role) {
       }
 
       state.youtubePending[role] = {
+        mode: 'oauth',
         loginId: d.login_id,
         verificationUrl: targetUrl,
         userCode: d.user_code || '',
         retryMs: Math.max(3000, Number(d.interval || 5) * 1000),
       };
+      state.youtubeAutoConnecting[role] = false;
       renderConnectForms();
       if (status) {
         status.textContent = d.user_code
@@ -1938,9 +2260,53 @@ async function startYoutubeAutoConnect(role) {
     const message = humanizePlatformError(d.error || 'Falha ao abrir o YouTube Music');
     if (status) status.textContent = message;
     showToast(message, 'error');
+    resetYoutubeAutoBtn(role);
   } catch {
     if (status) status.textContent = 'Erro de rede.';
     showToast('Erro ao abrir o YouTube Music automaticamente', 'error');
+    resetYoutubeAutoBtn(role);
+  }
+}
+
+async function startYoutubeGuidedConnect(role) {
+  const status = document.getElementById(`${role}-ytm-status`);
+  if (status) status.innerHTML = '<span class="spin-inline"></span> Abrindo uma janela guiada do YouTube Music...';
+
+  try {
+    const r = await fetch('/api/connect/youtube/guided/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ role }),
+    });
+    const d = await r.json();
+
+    if (d.ok && d.pending) {
+      state.youtubePending[role] = {
+        mode: 'guided',
+        loginId: d.login_id,
+        browserName: d.browser_name || '',
+        retryMs: 2500,
+      };
+      state.youtubeAutoConnecting[role] = false;
+      renderConnectForms();
+
+      const refreshedStatus = document.getElementById(`${role}-ytm-status`);
+      if (refreshedStatus) {
+        refreshedStatus.textContent = 'Entre na janela guiada do YouTube Music. Quando a conta estiver pronta, esta tela continua sozinha.';
+      }
+      showToast('Abri uma janela guiada do YouTube Music para terminar esse login automaticamente.', 'info');
+      setTimeout(() => finishYoutubeAutoConnect(role), 2200);
+      return;
+    }
+
+    const message = humanizePlatformError(d.error || 'Falha ao abrir a janela guiada do YouTube Music');
+    if (status) status.textContent = message;
+    showToast(message, 'error');
+    resetYoutubeAutoBtn(role);
+  } catch {
+    if (status) status.textContent = 'Erro de rede.';
+    showToast('Erro ao abrir a janela guiada do YouTube Music', 'error');
+    resetYoutubeAutoBtn(role);
   }
 }
 
@@ -1955,7 +2321,10 @@ async function finishYoutubeAutoConnect(role) {
   if (status) status.innerHTML = '<span class="spin-inline"></span> Confirmando a conta...';
 
   try {
-    const r = await fetch('/api/connect/youtube/auto/finish', {
+    const endpoint = pending.mode === 'guided'
+      ? '/api/connect/youtube/guided/finish'
+      : '/api/connect/youtube/auto/finish';
+    const r = await fetch(endpoint, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ login_id: pending.loginId }),
@@ -1971,6 +2340,7 @@ async function finishYoutubeAutoConnect(role) {
         state.destDisplayName = d.display_name;
       }
       state.youtubePending[role] = null;
+      state.youtubeAutoConnecting[role] = false;
       showToast('YouTube Music conectado!', 'success');
       renderConnectForms();
       checkTransferReady();
@@ -1979,9 +2349,11 @@ async function finishYoutubeAutoConnect(role) {
 
     if (d.pending) {
       if (status) {
-        status.textContent = pending.userCode
-          ? `Ainda aguardando a autorizacao. Se o Google pedir, use o codigo ${pending.userCode}.`
-          : 'Ainda aguardando a autorizacao na aba do Google.';
+        status.textContent = pending.mode === 'guided'
+          ? 'Ainda aguardando voce terminar o login na janela guiada do YouTube Music.'
+          : pending.userCode
+            ? `Ainda aguardando a autorizacao. Se o Google pedir, use o codigo ${pending.userCode}.`
+            : 'Ainda aguardando a autorizacao na aba do Google.';
       }
       setTimeout(() => finishYoutubeAutoConnect(role), Number(d.retry_after_ms || pending.retryMs || 4000));
       return;
@@ -1989,9 +2361,14 @@ async function finishYoutubeAutoConnect(role) {
 
     if (status) status.textContent = humanizePlatformError(d.error || 'Falha ao confirmar o YouTube Music');
     state.youtubePending[role] = null;
+    state.youtubeAutoConnecting[role] = false;
+    renderConnectForms();
     showToast(humanizePlatformError(d.error || 'Falha ao confirmar o YouTube Music'), 'error');
   } catch {
     if (status) status.textContent = 'Erro de rede.';
+    state.youtubePending[role] = null;
+    state.youtubeAutoConnecting[role] = false;
+    renderConnectForms();
     showToast('Erro ao confirmar o YouTube Music', 'error');
   }
 }
@@ -2421,6 +2798,29 @@ function humanizePlatformError(message) {
     return 'O login automatico do Spotify ainda nao foi ativado nesta instalacao.';
   }
 
+  if (lowered.includes('spotify ainda esta pausando essa sessao')) {
+    return raw;
+  }
+
+  if (
+    lowered.includes('spotify bloqueou a criacao da playlist') ||
+    lowered.includes('ativar o login oficial do spotify')
+  ) {
+    return 'O Spotify bloqueou a criacao por esse login do navegador. Para Spotify como destino, esta instalacao precisa usar o login oficial do Spotify.';
+  }
+
+  if (lowered.includes('api rate limit exceeded') && lowered.includes('spotify')) {
+    return 'O Spotify limitou essa sessao agora. Aguarde um pouco e tente conectar o Spotify novamente.';
+  }
+
+  if (lowered.includes('nao encontrei o login do spotify salvo nos navegadores desta maquina')) {
+    return 'Nao achei o login do Spotify salvo nos navegadores desta maquina. Abra o Spotify Web ja logado e tente de novo.';
+  }
+
+  if (lowered.includes('chrome desta maquina bloqueou a leitura automatica do spotify')) {
+    return 'O Chrome desta maquina bloqueou a leitura automatica do Spotify. O app vai depender da janela guiada ou do modo manual.';
+  }
+
   if (lowered.includes('nao encontrei o cookie arl do deezer')) {
     return 'Nao achei o login do Deezer salvo nos navegadores desta maquina. Abra o Deezer ja logado e tente de novo.';
   }
@@ -2435,6 +2835,14 @@ function humanizePlatformError(message) {
 
   if (lowered.includes('missing_arl')) {
     return 'Nao consegui extrair o login do Deezer automaticamente nessa tentativa.';
+  }
+
+  if (lowered.includes('arl_timeout')) {
+    return 'A janela do Deezer ficou aberta, mas o login nao terminou a tempo. Tente de novo e conclua o login nela.';
+  }
+
+  if (lowered.includes('arl_aborted')) {
+    return 'A janela do Deezer foi fechada antes do login automatico terminar.';
   }
 
   if (lowered.includes('nao consegui confirmar a captura automatica no chrome')) {
@@ -2482,6 +2890,22 @@ function humanizePlatformError(message) {
 
   if (lowered.includes('login oficial do youtube music ainda nao foi ativado')) {
     return 'O login oficial do YouTube Music ainda nao foi ativado nesta instalacao.';
+  }
+
+  if (lowered.includes('para usar soundcloud como destino') || (lowered.includes('soundcloud') && lowered.includes('access token'))) {
+    return 'Para usar o SoundCloud como destino aqui, cole o token da conta que vai receber a playlist.';
+  }
+
+  if (lowered.includes('developer token da apple music') || lowered.includes('music user token da apple music')) {
+    return 'Para usar a Apple Music aqui, faltam os codigos dessa conta.';
+  }
+
+  if (lowered.includes('api key do amazon music') || lowered.includes('access token do amazon music')) {
+    return 'Para usar Amazon Music aqui, faltam os dados liberados da API dessa conta.';
+  }
+
+  if (lowered.includes('beta fechado') && lowered.includes('amazon music')) {
+    return 'A Amazon Music ainda nao liberou esse acesso para esta conta ou aplicativo.';
   }
 
   if (lowered.includes('login do google foi cancelado')) {
@@ -2588,7 +3012,7 @@ function handleTransferError(ev) {
   showToast(message, 'error');
 }
 
-async function connectSpotify(role) {
+async function connectSpotify(role, credentials = null) {
   const spDc = document.getElementById(`${role}-spotify-cookie`)?.value?.trim() || '';
   const status = document.getElementById(`${role}-spotify-status`);
   if (status) status.innerHTML = '<span class="spin-inline"></span> Conectando...';
@@ -2597,7 +3021,7 @@ async function connectSpotify(role) {
     const r = await fetch('/api/connect/spotify', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ sp_dc: spDc }),
+      body: JSON.stringify({ ...(credentials || { sp_dc: spDc }), role }),
     });
     const d = await r.json();
 
@@ -2612,14 +3036,140 @@ async function connectSpotify(role) {
       showToast('Spotify conectado!', 'success');
       renderConnectForms();
       checkTransferReady();
-      return;
+      return true;
     }
 
     const message = humanizePlatformError(d.error || 'Falha ao conectar Spotify');
     if (status) status.textContent = message;
     showToast(message, 'error');
+    return false;
   } catch {
     if (status) status.textContent = 'Erro de rede.';
     showToast('Erro ao conectar Spotify', 'error');
+    return false;
+  }
+}
+
+async function autoConnectSpotify(role) {
+  const status = document.getElementById(`${role}-spotify-status`);
+  const btn = document.getElementById(`${role}-spotify-auto-btn`);
+  const hint = document.getElementById(`${role}-spotify-hint`);
+  const oauthConfigured = !!state.platforms.spotify?.oauth_configured;
+
+  if (oauthConfigured) {
+    if (status) status.innerHTML = '<span class="spin-inline"></span> Abrindo o login oficial do Spotify...';
+    openOAuthPopup('spotify', role);
+    return;
+  }
+
+  state.spotifyAutoConnecting = state.spotifyAutoConnecting || {};
+  state.spotifyAutoConnecting[role] = true;
+
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin-inline"></span> Conectando...';
+  }
+
+  if (status) {
+    status.innerHTML = '<span class="spin-inline"></span> Abrindo uma janela segura de login do Spotify...';
+  }
+  if (hint) {
+    hint.textContent = 'Uma janela chamada "Login Spotify - PlayTransfer" deve abrir agora. Entre nela se precisar e ela fecha sozinha quando a conexao der certo.';
+  }
+
+  try {
+    const r = await fetch('/api/connect/spotify/browser-guided/start', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ role }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      throw new Error(d.error || 'Falha ao iniciar captura');
+    }
+
+    await pollSpotifyAutoConnect(role, 0);
+  } catch (error) {
+    const message = humanizePlatformError(error?.message || 'Falha na captura automatica do Spotify');
+    if (status) status.textContent = message;
+    resetSpotifyAutoBtn(role);
+  }
+}
+
+async function pollSpotifyAutoConnect(role, attempt = 0) {
+  const status = document.getElementById(`${role}-spotify-status`);
+  const input = document.getElementById(`${role}-spotify-cookie`);
+
+  try {
+    const r = await fetch(`/api/connect/spotify/browser-guided/status?role=${encodeURIComponent(role)}`);
+    const d = await r.json();
+
+    if (d.status === 'pending') {
+      if (status) {
+        status.innerHTML = '<span class="spin-inline"></span> Aguardando voce concluir o login na janela "Login Spotify - PlayTransfer"...';
+      }
+    } else if (d.status === 'captured' && d.access_token) {
+      if (input && (d.cookie_header || d.sp_dc)) input.value = d.cookie_header || d.sp_dc;
+      if (status) {
+        status.innerHTML = '<span class="spin-inline"></span> Login capturado! Confirmando conexao...';
+      }
+
+      const success = await connectSpotify(
+        role,
+        d.access_token ? {
+          access_token: d.access_token,
+          trusted_webview: true,
+          client_token: d.client_token || '',
+          sp_dc: d.sp_dc || '',
+          cookie_header: d.cookie_header || '',
+        } : null
+      );
+      if (success) {
+        state.spotifyAutoConnecting[role] = false;
+        return;
+      }
+
+      resetSpotifyAutoBtn(role);
+      return;
+    } else if (d.status === 'error') {
+      let message = humanizePlatformError(d.error || 'Falha na captura automatica do Spotify');
+      if (String(d.error || '') === 'missing_spotify_token') {
+        message = 'Nao consegui confirmar o login do Spotify nessa tentativa. Abra a janela de login e tente de novo.';
+      }
+      if (status) status.textContent = message;
+      resetSpotifyAutoBtn(role);
+      return;
+    }
+  } catch {
+    if (status) status.textContent = 'Erro ao acompanhar a captura do Spotify. Tente de novo ou use o modo manual abaixo.';
+    resetSpotifyAutoBtn(role);
+    return;
+  }
+
+  if (attempt >= 160) {
+    if (status) status.textContent = 'A captura do Spotify demorou demais. Tente de novo ou use o modo manual abaixo.';
+    resetSpotifyAutoBtn(role);
+    return;
+  }
+
+  state.spotifyCapturePolls = state.spotifyCapturePolls || {};
+  state.spotifyCapturePolls[role] = setTimeout(() => {
+    pollSpotifyAutoConnect(role, attempt + 1);
+  }, 900);
+}
+
+function resetSpotifyAutoBtn(role) {
+  state.spotifyAutoConnecting = state.spotifyAutoConnecting || {};
+  state.spotifyAutoConnecting[role] = false;
+
+  if (state.spotifyCapturePolls?.[role]) {
+    clearTimeout(state.spotifyCapturePolls[role]);
+    state.spotifyCapturePolls[role] = null;
+  }
+
+  const btn = document.getElementById(`${role}-spotify-auto-btn`);
+  if (btn) {
+    btn.disabled = false;
+    btn.innerHTML = '🔌 Tentar novamente';
   }
 }

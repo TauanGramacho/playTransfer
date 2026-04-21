@@ -9,12 +9,69 @@ import time
 
 import requests
 
+try:
+    import browser_cookie3
+    BROWSER_COOKIE3_AVAILABLE = True
+except ImportError:
+    browser_cookie3 = None
+    BROWSER_COOKIE3_AVAILABLE = False
+
 _token_cache: dict = {"token": None, "expires": 0, "key": None}
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+
+def _spotify_headers(access_token: str = "", json_body: bool = False, client_token: str = "") -> dict:
+    headers = {
+        "User-Agent": UA,
+        "Accept": "application/json",
+        "Origin": "https://open.spotify.com",
+        "Referer": "https://open.spotify.com/",
+        "App-Platform": "WebPlayer",
+    }
+    token = _as_clean_text(access_token)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    client_token = _as_clean_text(client_token)
+    if client_token:
+        headers["client-token"] = client_token
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+class SpotifyRateLimitedError(ValueError):
+    """Raised when Spotify asks us to slow down."""
+
+    def __init__(self, message: str, retry_after: float | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def _retry_after_seconds(response) -> float | None:
+    retry_after = response.headers.get("Retry-After", "")
+    try:
+        return float(retry_after)
+    except Exception:
+        return None
+
+
+def _spotify_request(method: str, url: str, max_retries: int = 0, **kwargs):
+    """Call Spotify and respect short Retry-After windows."""
+    for attempt in range(max_retries + 1):
+        response = requests.request(method, url, **kwargs)
+        if response.status_code != 429 or attempt >= max_retries:
+            return response
+
+        wait_seconds = _retry_after_seconds(response)
+        if wait_seconds is None:
+            wait_seconds = min(2 + (attempt * 2), 12)
+        time.sleep(max(1, min(wait_seconds, 45)))
+
+    return response
 
 
 def _as_clean_text(value) -> str:
@@ -35,6 +92,15 @@ def _as_clean_text(value) -> str:
         parts = [_as_clean_text(item) for item in value]
         return " | ".join(part for part in parts if part)
     return str(value).strip()
+
+
+def _response_detail(response) -> str:
+    try:
+        payload = response.json()
+    except Exception:
+        payload = response.text
+    detail = _as_clean_text(payload)
+    return detail[:220] if detail else ""
 
 
 def _is_placeholder_sp_dc(value: str | None) -> bool:
@@ -67,6 +133,10 @@ def _normalize_cookie_header(cookie_header: str | None) -> str:
         return ""
     if raw.lower().startswith("cookie:"):
         raw = raw.split(":", 1)[1].strip()
+    lowered = raw.lower()
+    if any(marker in lowered for marker in ("path=", "domain=", "expires=", "max-age=", "httponly", "samesite=")):
+        sp_dc = _extract_sp_dc(raw)
+        return f"sp_dc={sp_dc}" if sp_dc else ""
     return raw
 
 
@@ -77,6 +147,82 @@ def _extract_sp_dc(value: str | None) -> str:
     if "sp_dc=" in raw:
         raw = raw.split("sp_dc=", 1)[1].split(";", 1)[0].strip()
     return "" if _is_placeholder_sp_dc(raw) else raw
+
+
+def _available_cookie_loaders() -> list[tuple[str, object]]:
+    if not BROWSER_COOKIE3_AVAILABLE:
+        return []
+
+    browser_names = [
+        ("Chrome", "chrome"),
+        ("Edge", "edge"),
+        ("Brave", "brave"),
+        ("Firefox", "firefox"),
+        ("Opera", "opera"),
+        ("Vivaldi", "vivaldi"),
+    ]
+    loaders = []
+    for label, attr in browser_names:
+        loader = getattr(browser_cookie3, attr, None)
+        if callable(loader):
+            loaders.append((label, loader))
+    return loaders
+
+
+def read_saved_spotify_cookie() -> dict:
+    """Try to read the Spotify login already saved in local browsers."""
+    if not BROWSER_COOKIE3_AVAILABLE:
+        raise ValueError(
+            "A leitura automatica do navegador ainda nao esta instalada nesta instalacao."
+        )
+
+    errors = []
+
+    for browser_name, loader in _available_cookie_loaders():
+        try:
+            jar = loader(domain_name="spotify.com")
+        except Exception as exc:
+            errors.append((browser_name, type(exc).__name__, str(exc)))
+            continue
+
+        cookie_pairs = []
+        sp_dc = ""
+
+        for cookie in jar:
+            domain = str(getattr(cookie, "domain", "") or "").lower()
+            if "spotify.com" not in domain:
+                continue
+
+            name = str(getattr(cookie, "name", "") or "").strip()
+            value = str(getattr(cookie, "value", "") or "").strip()
+            if not name or not value:
+                continue
+
+            cookie_pairs.append(f"{name}={value}")
+            if name == "sp_dc":
+                sp_dc = value
+
+        sp_dc = _extract_sp_dc(sp_dc)
+        if sp_dc:
+            return {
+                "sp_dc": sp_dc,
+                "cookie_header": "; ".join(cookie_pairs),
+                "browser": browser_name,
+            }
+
+    chrome_blocked = any(
+        browser_name == "Chrome" and error_type == "RequiresAdminError"
+        for browser_name, error_type, _ in errors
+    )
+    if chrome_blocked:
+        raise ValueError(
+            "O Chrome desta maquina bloqueou a leitura automatica do Spotify."
+        )
+
+    raise ValueError(
+        "Nao encontrei o login do Spotify salvo nos navegadores desta maquina. "
+        "Abra o Spotify Web ja logado e tente novamente."
+    )
 
 
 def get_token_via_sp_dc(sp_dc: str = None, cookie_header: str = None) -> str:
@@ -154,11 +300,17 @@ def validate(sp_dc: str = None, cookie_header: str = None) -> dict:
         raise ValueError("Cookie sp_dc nao fornecido.")
 
     token = get_token_via_sp_dc(sp_dc=normalized_sp_dc, cookie_header=cookie_header)
-    response = requests.get(
+    response = _spotify_request(
+        "GET",
         "https://api.spotify.com/v1/me",
-        headers={"Authorization": f"Bearer {token}", "User-Agent": UA},
+        headers=_spotify_headers(token),
         timeout=10,
     )
+    if response.status_code == 429:
+        raise SpotifyRateLimitedError(
+            "Spotify limitou temporariamente a confirmacao da sessao (HTTP 429).",
+            _retry_after_seconds(response),
+        )
     if response.status_code == 200:
         data = response.json()
         return {
@@ -168,6 +320,36 @@ def validate(sp_dc: str = None, cookie_header: str = None) -> dict:
         }
 
     return {"display_name": "Usuario Spotify", "email": "", "avatar": ""}
+
+
+def validate_access_token(access_token: str, client_token: str = "") -> dict:
+    """Validate a Spotify Web API token and return basic user info."""
+    token = _as_clean_text(access_token)
+    if not token:
+        raise ValueError("Token do Spotify nao fornecido.")
+
+    response = _spotify_request(
+        "GET",
+        "https://api.spotify.com/v1/me",
+        headers=_spotify_headers(token, client_token=client_token),
+        timeout=10,
+    )
+    if response.status_code == 401:
+        raise ValueError("Sessao do Spotify expirada. Conecte novamente.")
+    if response.status_code == 429:
+        raise SpotifyRateLimitedError(
+            "Spotify limitou temporariamente a confirmacao da sessao (HTTP 429).",
+            _retry_after_seconds(response),
+        )
+    if response.status_code != 200:
+        raise ValueError(f"Spotify recusou a sessao capturada (HTTP {response.status_code}).")
+
+    data = response.json()
+    return {
+        "display_name": data.get("display_name") or data.get("id") or "Usuario Spotify",
+        "email": data.get("email", ""),
+        "avatar": (data.get("images") or [{}])[0].get("url", ""),
+    }
 
 
 def _extract_id_and_type(url: str) -> tuple[str | None, str | None]:
@@ -189,10 +371,11 @@ def _parse_embed_payload(html: str) -> dict:
 
 
 def _read_via_token(media_type: str, playlist_id: str, access_token: str) -> tuple[str, list[dict]]:
-    headers = {"Authorization": f"Bearer {access_token}", "User-Agent": UA}
+    headers = _spotify_headers(access_token)
     endpoint = "playlists" if media_type == "playlist" else "albums"
 
-    response = requests.get(
+    response = _spotify_request(
+        "GET",
         f"https://api.spotify.com/v1/{endpoint}/{playlist_id}",
         headers=headers,
         timeout=10,
@@ -201,6 +384,11 @@ def _read_via_token(media_type: str, playlist_id: str, access_token: str) -> tup
         raise ValueError("Sessao do Spotify expirada. Conecte novamente.")
     if response.status_code == 404:
         raise ValueError("Playlist nao encontrada. Verifique se ela esta publica ou se voce tem acesso.")
+    if response.status_code == 429:
+        raise SpotifyRateLimitedError(
+            "Spotify pediu para aguardar antes de ler a playlist (HTTP 429).",
+            _retry_after_seconds(response),
+        )
     if response.status_code != 200:
         raise ValueError(f"Erro do Spotify (HTTP {response.status_code})")
 
@@ -210,7 +398,8 @@ def _read_via_token(media_type: str, playlist_id: str, access_token: str) -> tup
     offset = 0
 
     while True:
-        page_response = requests.get(
+        page_response = _spotify_request(
+            "GET",
             f"https://api.spotify.com/v1/{endpoint}/{playlist_id}/tracks",
             headers=headers,
             params={
@@ -220,6 +409,11 @@ def _read_via_token(media_type: str, playlist_id: str, access_token: str) -> tup
             },
             timeout=15,
         )
+        if page_response.status_code == 429:
+            raise SpotifyRateLimitedError(
+                "Spotify pediu para aguardar antes de ler mais musicas (HTTP 429).",
+                _retry_after_seconds(page_response),
+            )
         if page_response.status_code != 200:
             break
 
@@ -316,10 +510,11 @@ def read_playlist(
         )
 
     token = get_token_via_sp_dc(sp_dc=normalized_sp_dc, cookie_header=cookie_header)
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": UA}
+    headers = _spotify_headers(token)
     endpoint = "playlists" if media_type == "playlist" else "albums"
 
-    info_response = requests.get(
+    info_response = _spotify_request(
+        "GET",
         f"https://api.spotify.com/v1/{endpoint}/{playlist_id}",
         headers=headers,
         timeout=10,
@@ -329,6 +524,11 @@ def read_playlist(
         raise ValueError("Token do Spotify expirou. Reconecte o Spotify.")
     if info_response.status_code == 404:
         raise ValueError("Playlist nao encontrada. Verifique se ela esta publica.")
+    if info_response.status_code == 429:
+        raise SpotifyRateLimitedError(
+            "Spotify pediu para aguardar antes de ler a playlist (HTTP 429).",
+            _retry_after_seconds(info_response),
+        )
     if info_response.status_code != 200:
         raise ValueError(f"Erro do Spotify (HTTP {info_response.status_code})")
 
@@ -338,7 +538,8 @@ def read_playlist(
     offset = 0
 
     while True:
-        page_response = requests.get(
+        page_response = _spotify_request(
+            "GET",
             f"https://api.spotify.com/v1/{endpoint}/{playlist_id}/tracks",
             headers=headers,
             params={
@@ -348,6 +549,11 @@ def read_playlist(
             },
             timeout=15,
         )
+        if page_response.status_code == 429:
+            raise SpotifyRateLimitedError(
+                "Spotify pediu para aguardar antes de ler mais musicas (HTTP 429).",
+                _retry_after_seconds(page_response),
+            )
         if page_response.status_code != 200:
             break
 
@@ -374,7 +580,13 @@ def read_playlist(
     return playlist_name, tracks
 
 
-def search_track(access_token: str, titulo: str, artista: str = "", album: str = "") -> str | None:
+def search_track(
+    access_token: str,
+    titulo: str,
+    artista: str = "",
+    album: str = "",
+    client_token: str = "",
+) -> str | None:
     """Search a track on Spotify and return its best-matching URI."""
     if not access_token:
         raise ValueError("Access token do Spotify nao informado.")
@@ -387,39 +599,49 @@ def search_track(access_token: str, titulo: str, artista: str = "", album: str =
         queries.append(f"{artista} {titulo}")
     queries.append(titulo)
 
-    headers = {"Authorization": f"Bearer {access_token}", "User-Agent": UA}
+    headers = _spotify_headers(access_token, client_token=client_token)
 
     for query in queries:
         try:
-            response = requests.get(
+            response = _spotify_request(
+                "GET",
                 "https://api.spotify.com/v1/search",
                 headers=headers,
                 params={"q": query, "type": "track", "limit": 5},
                 timeout=10,
             )
+            if response.status_code == 429:
+                raise SpotifyRateLimitedError(
+                    "Spotify pediu para aguardar antes de procurar musicas (HTTP 429).",
+                    _retry_after_seconds(response),
+                )
             if response.status_code != 200:
                 continue
             items = response.json().get("tracks", {}).get("items", [])
             if items:
                 return items[0].get("uri")
+        except SpotifyRateLimitedError:
+            raise
         except Exception:
             continue
 
     return None
 
 
-def create_playlist(access_token: str, nome: str, descricao: str = "") -> str:
+def create_playlist(
+    access_token: str,
+    nome: str,
+    descricao: str = "",
+    client_token: str = "",
+) -> str:
     """Create a private playlist on Spotify and return its id."""
     if not access_token:
         raise ValueError("Access token do Spotify nao informado.")
 
-    response = requests.post(
+    response = _spotify_request(
+        "POST",
         "https://api.spotify.com/v1/me/playlists",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "User-Agent": UA,
-            "Content-Type": "application/json",
-        },
+        headers=_spotify_headers(access_token, json_body=True, client_token=client_token),
         json={
             "name": nome,
             "description": descricao or "Transferida via PlayTransfer",
@@ -428,8 +650,19 @@ def create_playlist(access_token: str, nome: str, descricao: str = "") -> str:
         timeout=15,
     )
 
+    if response.status_code == 429:
+        detail = _response_detail(response)
+        message = "Spotify pediu para aguardar antes de criar a playlist (HTTP 429)."
+        if detail:
+            message += f" Detalhe: {detail}"
+        raise SpotifyRateLimitedError(
+            message,
+            _retry_after_seconds(response),
+        )
     if response.status_code not in (200, 201):
-        raise ValueError(f"Nao foi possivel criar playlist no Spotify (HTTP {response.status_code}).")
+        detail = _response_detail(response)
+        suffix = f" Detalhe: {detail}" if detail else ""
+        raise ValueError(f"Nao foi possivel criar playlist no Spotify (HTTP {response.status_code}).{suffix}")
 
     playlist_id = response.json().get("id")
     if not playlist_id:
@@ -437,24 +670,31 @@ def create_playlist(access_token: str, nome: str, descricao: str = "") -> str:
     return playlist_id
 
 
-def add_tracks(access_token: str, playlist_id: str, track_uris: list[str]) -> None:
+def add_tracks(
+    access_token: str,
+    playlist_id: str,
+    track_uris: list[str],
+    client_token: str = "",
+) -> None:
     """Add track URIs to a Spotify playlist in batches."""
     if not access_token:
         raise ValueError("Access token do Spotify nao informado.")
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "User-Agent": UA,
-        "Content-Type": "application/json",
-    }
+    headers = _spotify_headers(access_token, json_body=True, client_token=client_token)
 
     for index in range(0, len(track_uris), 100):
         chunk = track_uris[index : index + 100]
-        response = requests.post(
+        response = _spotify_request(
+            "POST",
             f"https://api.spotify.com/v1/playlists/{playlist_id}/items",
             headers=headers,
             json={"uris": chunk},
             timeout=15,
         )
+        if response.status_code == 429:
+            raise SpotifyRateLimitedError(
+                "Spotify pediu para aguardar antes de adicionar musicas (HTTP 429).",
+                _retry_after_seconds(response),
+            )
         if response.status_code not in (200, 201):
             raise ValueError(f"Erro ao adicionar faixas no Spotify (HTTP {response.status_code}).")
