@@ -31,7 +31,7 @@
   if (window.opener) {
     window.opener.postMessage(
       { type: 'oauth_done', sid, role, displayName, platform, error },
-      window.location.origin
+      '*'
     );
     window.close();
   } else {

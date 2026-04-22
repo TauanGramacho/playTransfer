@@ -127,8 +127,46 @@ def get_base_url() -> str:
     return request.host_url.rstrip("/")
 
 
+def normalize_spotify_base_url(base_url: str) -> str:
+    raw = (base_url or "").strip().rstrip("/")
+    if not raw:
+        raw = get_base_url()
+    try:
+        parsed = urllib.parse.urlparse(raw)
+        if parsed.hostname in {"localhost", "0.0.0.0"}:
+            netloc = "127.0.0.1"
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            return urllib.parse.urlunparse((
+                parsed.scheme or "http",
+                netloc,
+                parsed.path.rstrip("/"),
+                "",
+                "",
+                "",
+            )).rstrip("/")
+    except Exception:
+        pass
+    return raw
+
+
+def get_spotify_base_url() -> str:
+    """Spotify requires loopback redirects to use an IP literal, not localhost."""
+    return normalize_spotify_base_url(get_base_url())
+
+
 def build_callback_url(platform: str) -> str:
-    return f"{get_base_url()}/auth/{platform}/callback"
+    base_url = get_spotify_base_url() if platform == "spotify" else get_base_url()
+    return f"{base_url}/auth/{platform}/callback"
+
+
+@app.route("/api/config/spotify-redirect")
+def spotify_redirect_config():
+    return jsonify({
+        "ok": True,
+        "base_url": get_spotify_base_url(),
+        "redirect_uri": build_callback_url("spotify"),
+    })
 
 
 def _base64url(data: bytes) -> str:
@@ -177,6 +215,85 @@ SPOTIFY_SCOPES        = (
     "user-read-email"
 )
 
+
+def _write_env_values(updates: dict[str, str]) -> None:
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    lines: list[str] = []
+    if os.path.exists(env_path):
+        with open(env_path, "r", encoding="utf-8") as env_file:
+            lines = env_file.readlines()
+
+    seen: set[str] = set()
+    output: list[str] = []
+    for line in lines:
+        if "=" not in line or line.lstrip().startswith("#"):
+            output.append(line)
+            continue
+
+        key = line.split("=", 1)[0].strip()
+        if key in updates:
+            output.append(f"{key}={updates[key]}\n")
+            seen.add(key)
+        else:
+            output.append(line)
+
+    if output and output[-1].strip():
+        output.append("\n")
+
+    for key, value in updates.items():
+        if key not in seen:
+            output.append(f"{key}={value}\n")
+
+    with open(env_path, "w", encoding="utf-8") as env_file:
+        env_file.writelines(output)
+
+
+def _looks_like_spotify_client_id(value: str) -> bool:
+    return 20 <= len(value) <= 80 and all(char.isalnum() for char in value)
+
+
+@app.route("/api/config/spotify-oauth", methods=["POST"])
+def configure_spotify_oauth():
+    global SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, BASE_URL
+
+    data = request.json or {}
+    client_id = str(data.get("client_id") or "").strip()
+    client_secret = str(data.get("client_secret") or "").strip()
+    base_url = normalize_spotify_base_url(str(data.get("base_url") or "").strip() or get_base_url())
+
+    if not _looks_like_spotify_client_id(client_id):
+        return jsonify({
+            "ok": False,
+            "error": "Cole o Client ID do app Spotify. Ele fica no Spotify Developer Dashboard.",
+        })
+
+    if any(char in client_secret for char in "\r\n"):
+        return jsonify({"ok": False, "error": "Client Secret invalido."})
+
+    try:
+        _write_env_values({
+            "BASE_URL": base_url,
+            "SPOTIFY_CLIENT_ID": client_id,
+            "SPOTIFY_CLIENT_SECRET": client_secret,
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Nao consegui salvar no .env: {exc}"})
+
+    BASE_URL = base_url
+    SPOTIFY_CLIENT_ID = client_id
+    SPOTIFY_CLIENT_SECRET = client_secret
+    os.environ["BASE_URL"] = base_url
+    os.environ["SPOTIFY_CLIENT_ID"] = client_id
+    os.environ["SPOTIFY_CLIENT_SECRET"] = client_secret
+
+    return jsonify({
+        "ok": True,
+        "oauth_configured": True,
+        "oauth_mode": "pkce" if not client_secret else "server",
+        "oauth_redirect_uri": build_callback_url("spotify"),
+    })
+
+
 @app.route("/auth/spotify")
 def auth_spotify():
     if not SPOTIFY_CLIENT_ID:
@@ -192,7 +309,7 @@ def auth_spotify():
         "redirect_uri":  build_callback_url("spotify"),
         "scope":         SPOTIFY_SCOPES,
         "state":         state,
-        "show_dialog":   "false",
+        "show_dialog":   "true",
     }
 
     if not SPOTIFY_CLIENT_SECRET:
@@ -247,17 +364,29 @@ def auth_spotify_callback():
     )
 
     if r.status_code != 200:
+        try:
+            print(f"[Spotify OAuth] token exchange failed: {r.status_code} {r.text[:300]}")
+        except Exception:
+            pass
         return redirect(f"/oauth-callback?error=token_exchange_failed")
 
     token_data = r.json()
     access_token = token_data.get("access_token", "")
 
     # Busca info do usuário
-    me = req_lib.get(
+    me_response = req_lib.get(
         "https://api.spotify.com/v1/me",
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=10,
-    ).json()
+    )
+    if me_response.status_code != 200:
+        try:
+            print(f"[Spotify OAuth] /v1/me failed: {me_response.status_code} {me_response.text[:300]}")
+        except Exception:
+            pass
+        return redirect("/oauth-callback?error=spotify_profile_failed")
+
+    me = me_response.json()
 
     display_name = me.get("display_name", me.get("id", "Usuário Spotify"))
     avatar = (me.get("images") or [{}])[0].get("url", "")
@@ -407,14 +536,24 @@ def connect_spotify_manual():
     if "sp_dc=" not in cookie_header and "sp_key=" not in cookie_header:
         cookie_header = ""
 
+    if role == "dest":
+        if not SPOTIFY_CLIENT_ID:
+            return jsonify({"ok": False, "error": "spotify_oauth_required_for_destination"})
+        return jsonify({"ok": False, "error": "spotify_destination_requires_oauth_reconnect"})
+
     if access_token:
         trusted_webview = bool(data.get("trusted_webview"))
-        if trusted_webview:
-            display_name = str(data.get("display_name") or "").strip() or "Conta Spotify"
-            info = {"display_name": display_name, "avatar": ""}
+        webview_display_name = str(data.get("display_name") or "").strip()
+        if trusted_webview and webview_display_name:
+            info = {
+                "display_name": webview_display_name,
+                "avatar": str(data.get("avatar") or "").strip(),
+            }
         else:
             try:
                 info = spotify.validate_access_token(access_token, client_token=client_token)
+                if not info.get("display_name"):
+                    info["display_name"] = "Conta Spotify"
             except spotify.SpotifyRateLimitedError as exc:
                 wait_seconds = int(exc.retry_after or 60)
                 return jsonify({
@@ -425,7 +564,19 @@ def connect_spotify_manual():
                     ),
                 })
             except Exception as e:
-                return jsonify({"ok": False, "error": str(e)})
+                if trusted_webview and (sp_dc or cookie_header):
+                    print(f"[Spotify] Webview token invalido ({e}), tentando via sp_dc...")
+                    try:
+                        fresh_token = spotify.get_token_via_sp_dc(sp_dc=sp_dc, cookie_header=cookie_header or None)
+                        if fresh_token:
+                            access_token = fresh_token
+                            info = spotify.validate_access_token(access_token, client_token=client_token)
+                        else:
+                            return jsonify({"ok": False, "error": "Token do Spotify capturado e invalido e o sp_dc nao gerou um novo. Tente reconectar."})
+                    except Exception as e2:
+                        return jsonify({"ok": False, "error": f"Nao foi possivel confirmar a sessao do Spotify: {e2}"})
+                else:
+                    return jsonify({"ok": False, "error": str(e)})
 
         try:
             sid = create_session(
@@ -517,6 +668,7 @@ def _run_spotify_guided_capture(role: str):
     payload = {}
     aborted = False
     timed_out = False
+    login_rejected = False
 
     for raw_line in (completed.stdout or "").splitlines():
         line = raw_line.strip()
@@ -529,13 +681,15 @@ def _run_spotify_guided_capture(role: str):
             aborted = True
         elif line.startswith("SPOTIFY_TIMEOUT:"):
             timed_out = True
+        elif line.startswith("SPOTIFY_LOGIN_REJECTED:"):
+            login_rejected = True
 
     access_token = str(payload.get("access_token") or "").strip()
     client_token = str(payload.get("client_token") or "").strip()
     sp_dc = str(payload.get("sp_dc") or "").strip()
     cookie_header = str(payload.get("cookie_header") or "").strip()
 
-    if access_token:
+    if access_token or sp_dc or cookie_header:
         attempt.update({
             "status": "captured",
             "error": "",
@@ -543,6 +697,8 @@ def _run_spotify_guided_capture(role: str):
             "client_token": client_token,
             "sp_dc": sp_dc,
             "cookie_header": cookie_header,
+            "display_name": str(payload.get("display_name") or "").strip(),
+            "avatar": str(payload.get("avatar") or "").strip(),
             "step": "captured",
             "updated_at": time.time(),
         })
@@ -553,6 +709,18 @@ def _run_spotify_guided_capture(role: str):
             "status": "error",
             "error": "Voce fechou a janela do Spotify antes de concluir o login.",
             "step": "aborted",
+            "updated_at": time.time(),
+        })
+        return
+
+    if login_rejected:
+        attempt.update({
+            "status": "error",
+            "error": (
+                "O Spotify recusou o login nessa janela. "
+                "Essa conta pode usar Google/Apple/Facebook ou o Spotify pode estar bloqueando navegador embutido."
+            ),
+            "step": "login_rejected",
             "updated_at": time.time(),
         })
         return
@@ -578,6 +746,19 @@ def _run_spotify_guided_capture(role: str):
 def connect_spotify_browser_guided_start():
     data = request.json or {}
     role = str(data.get("role") or "dest").strip() or "dest"
+
+    if role == "dest" and not SPOTIFY_CLIENT_ID:
+        spotify_browser_guided[role] = {
+            "status": "error",
+            "error": "spotify_oauth_required_for_destination",
+            "access_token": "",
+            "client_token": "",
+            "sp_dc": "",
+            "cookie_header": "",
+            "step": "oauth_required",
+            "updated_at": time.time(),
+        }
+        return jsonify({"ok": False, "error": "spotify_oauth_required_for_destination"})
 
     spotify_browser_guided[role] = {
         "status": "pending",
@@ -1086,6 +1267,7 @@ def api_platforms():
     p = {key: {**value} for key, value in PLATFORMS.items()}
     p["spotify"]["oauth_configured"] = bool(SPOTIFY_CLIENT_ID)
     p["spotify"]["oauth_mode"] = "pkce" if (SPOTIFY_CLIENT_ID and not SPOTIFY_CLIENT_SECRET) else "server"
+    p["spotify"]["oauth_redirect_uri"] = build_callback_url("spotify")
     p["deezer"]["oauth_configured"]  = bool(DEEZER_APP_ID and DEEZER_SECRET_KEY)
     p["soundcloud"]["auto_configured"] = bool(os.getenv("SOUNDCLOUD_ACCESS_TOKEN", "").strip())
     p["apple"]["auto_configured"] = bool(
@@ -1246,7 +1428,13 @@ def run_transfer(job: dict, data: dict):
 
             dest_sess = sessions.get(dest_sid, {})
             is_official_spotify_login = dest_sess.get("auth_source") == "oauth"
+            if not is_official_spotify_login:
+                if SPOTIFY_CLIENT_ID:
+                    raise ValueError("spotify_destination_requires_oauth_reconnect")
+                raise ValueError("spotify_oauth_required_for_destination")
+
             access_token = dest_sess.get("access_token")
+            refresh_token = dest_sess.get("refresh_token", "")
             sp_dc = dest_sess.get("sp_dc")
             cookie_header = dest_sess.get("spotify_cookie_header", "")
             client_token = dest_sess.get("spotify_client_token", "")
@@ -1255,23 +1443,47 @@ def run_transfer(job: dict, data: dict):
             if not access_token:
                 raise ValueError("Sessão do Spotify não encontrada. Reconecte o Spotify.")
 
-            def refresh_spotify_token():
-                nonlocal access_token
-                if not (sp_dc or cookie_header):
-                    return False
-                try:
-                    fresh_token = spotify.get_token_via_sp_dc(sp_dc=sp_dc, cookie_header=cookie_header)
-                except Exception as exc:
-                    print(f"[Spotify] Nao consegui renovar token: {exc}")
-                    return False
-                if not fresh_token:
-                    return False
-                access_token = fresh_token
-                if dest_sid in sessions:
-                    sessions[dest_sid]["access_token"] = fresh_token
-                return True
+            token_refresh_count = 0
 
-            if sp_dc or cookie_header:
+            def refresh_spotify_token():
+                nonlocal access_token, token_refresh_count
+                # Attempt 1: OAuth refresh_token (works for OAuth connections)
+                if refresh_token and SPOTIFY_CLIENT_ID:
+                    try:
+                        fresh_token = spotify.refresh_oauth_token(
+                            refresh_token,
+                            client_id=SPOTIFY_CLIENT_ID,
+                            client_secret=SPOTIFY_CLIENT_SECRET,
+                        )
+                        if fresh_token:
+                            access_token = fresh_token
+                            if dest_sid in sessions:
+                                sessions[dest_sid]["access_token"] = fresh_token
+                            token_refresh_count += 1
+                            print(f"[Spotify] Token renovado via OAuth refresh (#{token_refresh_count})")
+                            return True
+                    except Exception as exc:
+                        print(f"[Spotify] OAuth refresh falhou: {exc}")
+
+                # Attempt 2: sp_dc cookie (works for webview/manual connections)
+                if sp_dc or cookie_header:
+                    try:
+                        fresh_token = spotify.get_token_via_sp_dc(sp_dc=sp_dc, cookie_header=cookie_header)
+                    except Exception as exc:
+                        print(f"[Spotify] Nao consegui renovar token via sp_dc: {exc}")
+                        return False
+                    if fresh_token:
+                        access_token = fresh_token
+                        if dest_sid in sessions:
+                            sessions[dest_sid]["access_token"] = fresh_token
+                        token_refresh_count += 1
+                        print(f"[Spotify] Token renovado via sp_dc (#{token_refresh_count})")
+                        return True
+
+                return False
+
+            # Pre-refresh the token to start with a fresh one
+            if sp_dc or cookie_header or (refresh_token and SPOTIFY_CLIENT_ID):
                 refresh_spotify_token()
 
             def spotify_with_visible_wait(
@@ -1285,12 +1497,27 @@ def run_transfer(job: dict, data: dict):
                 last_error = None
                 total_waited = 0
                 refreshed_after_limit = False
+                token_refreshed_for_expiry = False
 
                 for attempt in range(attempts):
                     try:
                         if attempt:
                             emit(job, {"type": "status", "msg": f"Tentando {action_label} no Spotify..."})
                         return action()
+                    except spotify.SpotifyTokenExpiredError as exc:
+                        # Token expired (401) — try to refresh and retry
+                        if not token_refreshed_for_expiry and refresh_spotify_token():
+                            token_refreshed_for_expiry = True
+                            emit(job, {
+                                "type": "status",
+                                "msg": "Sessao do Spotify renovada. Tentando de novo..."
+                            })
+                            continue
+                        # Could not refresh — raise as user-facing error
+                        raise ValueError(
+                            "A sessao do Spotify expirou e nao foi possivel renovar. "
+                            "Reconecte o Spotify e tente novamente."
+                        ) from exc
                     except spotify.SpotifyRateLimitedError as exc:
                         last_error = exc
 
@@ -1339,9 +1566,9 @@ def run_transfer(job: dict, data: dict):
                         "Transferida via PlayTransfer",
                         client_token=client_token,
                     ),
-                    attempts=6 if is_official_spotify_login else 4,
+                    attempts=6,
                     max_wait_seconds=70,
-                    max_total_wait_seconds=240 if is_official_spotify_login else 210,
+                    max_total_wait_seconds=300 if is_official_spotify_login else 240,
                     refresh_on_first_limit=True,
                 )
             except spotify.SpotifyRateLimitedError as exc:

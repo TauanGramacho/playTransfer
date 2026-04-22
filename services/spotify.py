@@ -51,6 +51,11 @@ class SpotifyRateLimitedError(ValueError):
         self.retry_after = retry_after
 
 
+class SpotifyTokenExpiredError(ValueError):
+    """Raised when the Spotify access token is expired or invalid (HTTP 401)."""
+    pass
+
+
 def _retry_after_seconds(response) -> float | None:
     retry_after = response.headers.get("Retry-After", "")
     try:
@@ -320,6 +325,49 @@ def validate(sp_dc: str = None, cookie_header: str = None) -> dict:
         }
 
     return {"display_name": "Usuario Spotify", "email": "", "avatar": ""}
+
+
+def refresh_oauth_token(refresh_token: str, client_id: str = "", client_secret: str = "") -> str | None:
+    """Exchange a Spotify OAuth refresh_token for a new access_token."""
+    if not refresh_token:
+        return None
+
+    client_id = client_id or os.getenv("SPOTIFY_CLIENT_ID", "")
+    client_secret = client_secret or os.getenv("SPOTIFY_CLIENT_SECRET", "")
+    if not client_id:
+        return None
+
+    token_payload = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+    }
+    token_headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+    if client_secret:
+        import base64 as _b64
+        credentials = _b64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        token_headers["Authorization"] = f"Basic {credentials}"
+
+    try:
+        response = requests.post(
+            "https://accounts.spotify.com/api/token",
+            headers=token_headers,
+            data=token_payload,
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        new_token = data.get("access_token", "")
+        if new_token:
+            _token_cache["token"] = new_token
+            expires_in = data.get("expires_in", 3600)
+            _token_cache["expires"] = time.time() + expires_in
+            _token_cache["key"] = new_token
+        return new_token or None
+    except Exception:
+        return None
 
 
 def validate_access_token(access_token: str, client_token: str = "") -> dict:
@@ -610,6 +658,10 @@ def search_track(
                 params={"q": query, "type": "track", "limit": 5},
                 timeout=10,
             )
+            if response.status_code == 401:
+                raise SpotifyTokenExpiredError(
+                    "Sessao do Spotify expirada durante busca de musicas."
+                )
             if response.status_code == 429:
                 raise SpotifyRateLimitedError(
                     "Spotify pediu para aguardar antes de procurar musicas (HTTP 429).",
@@ -620,7 +672,7 @@ def search_track(
             items = response.json().get("tracks", {}).get("items", [])
             if items:
                 return items[0].get("uri")
-        except SpotifyRateLimitedError:
+        except (SpotifyRateLimitedError, SpotifyTokenExpiredError):
             raise
         except Exception:
             continue
@@ -638,6 +690,7 @@ def create_playlist(
     if not access_token:
         raise ValueError("Access token do Spotify nao informado.")
 
+    print(f"[Spotify DEBUG] create_playlist chamado. Token (primeiros 20 chars): {access_token[:20] if access_token else 'VAZIO'}...")
     response = _spotify_request(
         "POST",
         "https://api.spotify.com/v1/me/playlists",
@@ -649,7 +702,12 @@ def create_playlist(
         },
         timeout=15,
     )
+    print(f"[Spotify DEBUG] create_playlist HTTP {response.status_code} — Body: {response.text[:500]}")
 
+    if response.status_code == 401:
+        raise SpotifyTokenExpiredError(
+            "Sessao do Spotify expirada. Tentando renovar..."
+        )
     if response.status_code == 429:
         detail = _response_detail(response)
         message = "Spotify pediu para aguardar antes de criar a playlist (HTTP 429)."
@@ -658,6 +716,13 @@ def create_playlist(
         raise SpotifyRateLimitedError(
             message,
             _retry_after_seconds(response),
+        )
+    if response.status_code == 403:
+        detail = _response_detail(response)
+        raise ValueError(
+            "O Spotify bloqueou a criacao da playlist com esta sessao (HTTP 403). "
+            "Tente reconectar o Spotify ou use o login oficial OAuth."
+            + (f" Detalhe: {detail}" if detail else "")
         )
     if response.status_code not in (200, 201):
         detail = _response_detail(response)
@@ -691,6 +756,10 @@ def add_tracks(
             json={"uris": chunk},
             timeout=15,
         )
+        if response.status_code == 401:
+            raise SpotifyTokenExpiredError(
+                "Sessao do Spotify expirada ao adicionar musicas."
+            )
         if response.status_code == 429:
             raise SpotifyRateLimitedError(
                 "Spotify pediu para aguardar antes de adicionar musicas (HTTP 429).",

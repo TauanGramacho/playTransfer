@@ -1,6 +1,8 @@
 import ctypes
 import json
+import os
 import re
+import tempfile
 import threading
 import time
 
@@ -8,7 +10,25 @@ import webview
 
 
 WINDOW_TITLE = "Login Spotify - PlayTransfer"
-LOGIN_URL = "https://open.spotify.com/"
+SPOTIFY_HOME_URL = "https://open.spotify.com/"
+LOGIN_URL = "https://accounts.spotify.com/pt-BR/login?continue=https%3A%2F%2Fopen.spotify.com%2F"
+DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".runtime", "spotify_webview_debug.log")
+CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/123.0.0.0 Safari/537.36"
+)
+
+
+def _debug(message):
+    line = f"[{time.strftime('%H:%M:%S')}] {message}"
+    print(f"[Spotify WebView] {message}", flush=True)
+    try:
+        os.makedirs(os.path.dirname(DEBUG_LOG_PATH), exist_ok=True)
+        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as debug_file:
+            debug_file.write(line + "\n")
+    except Exception:
+        pass
 SPOTIFY_CAPTURE_JS = r"""
 (function() {
   function remember(token, source) {
@@ -42,6 +62,7 @@ SPOTIFY_CAPTURE_JS = r"""
   function consider(value, source) {
     var text = String(value || '');
     if (!text) return false;
+    if (/["']?isAnonymous["']?\s*:\s*true/i.test(text)) return false;
 
     var direct = text.match(/\b(BQ[A-Za-z0-9_-]{40,})\b/);
     if (direct && remember(direct[1], source)) return true;
@@ -171,15 +192,21 @@ SPOTIFY_CAPTURE_JS = r"""
   scanStorage('sessionStorage');
   walk(window.__NEXT_DATA__, 'window.__NEXT_DATA__', 0);
 
-  try {
-    fetch('/api/token', { credentials: 'include', headers: { accept: 'application/json' } })
+    [
+      '/api/token',
+      '/api/token?reason=transport&productType=web_player',
+      '/get_access_token?reason=transport&productType=web_player'
+    ].forEach(function(tokenUrl) {
+      try {
+        fetch(tokenUrl, { credentials: 'include', headers: { accept: 'application/json' } })
       .then(function(response) { return response.text(); })
       .then(function(text) {
-        consider(text, 'open.spotify.com/api/token');
-        walk(text, 'open.spotify.com/api/token', 0);
+        consider(text, 'open.spotify.com:' + tokenUrl);
+        walk(text, 'open.spotify.com:' + tokenUrl, 0);
       })
       .catch(function() {});
-  } catch (e) {}
+      } catch (e) {}
+    });
 
   if (!window.__ptSpotifyIndexedDbScanStarted && window.indexedDB && indexedDB.databases) {
     window.__ptSpotifyIndexedDbScanStarted = true;
@@ -254,18 +281,38 @@ def _remember_cookie_header(shared, cookie_text):
     sp_dc = _extract_sp_dc(raw)
     if sp_dc and not shared["sp_dc"]:
         shared["sp_dc"] = sp_dc
+        _debug("Cookie sp_dc encontrado na janela.")
     if sp_dc and not shared["cookie_header"]:
         shared["cookie_header"] = raw
     _remember_access_token(shared, raw)
 
 
+def _remember_authorization_header(shared, value):
+    raw = str(value or "").strip()
+    if not raw:
+        return
+
+    match = re.search(r"Bearer\s+([A-Za-z0-9._-]{40,})", raw, re.IGNORECASE)
+    if match:
+        _debug("Header Authorization Bearer encontrado na janela.")
+        _remember_access_token(shared, match.group(1))
+
+
 def _extract_from_cookie_objects(shared, cookies):
     for cookie in cookies or []:
         try:
-            name = str(getattr(cookie, "name", "") or "").strip()
-            value = str(getattr(cookie, "value", "") or "").strip()
-            domain = str(getattr(cookie, "domain", "") or "").lower()
-            if not name or not value or "spotify.com" not in domain:
+            if isinstance(cookie, dict):
+                name = str(cookie.get("name") or "").strip()
+                value = str(cookie.get("value") or "").strip()
+                domain = str(cookie.get("domain") or cookie.get("host") or "").lower()
+            else:
+                name = str(getattr(cookie, "name", "") or "").strip()
+                value = str(getattr(cookie, "value", "") or "").strip()
+                domain = str(getattr(cookie, "domain", "") or "").lower()
+            spotify_cookie_names = {"sp_dc", "sp_key", "sp_t", "sp_landing", "sp_landingref"}
+            if not name or not value:
+                continue
+            if "spotify.com" not in domain and name not in spotify_cookie_names:
                 continue
 
             _remember_cookie_header(shared, f"{name}={value}")
@@ -274,7 +321,7 @@ def _extract_from_cookie_objects(shared, cookies):
             if name == "sp_dc" and not shared["sp_dc"]:
                 shared["sp_dc"] = value
 
-            if hasattr(cookie, "output"):
+            if not isinstance(cookie, dict) and hasattr(cookie, "output"):
                 _remember_cookie_header(shared, cookie.output())
         except Exception:
             continue
@@ -288,12 +335,14 @@ def _remember_access_token(shared, token_payload):
 
     payload = token_payload
     if isinstance(payload, str):
-        direct_token = _extract_access_token_from_text(payload)
-        if direct_token and not shared["access_token"]:
-            shared["access_token"] = direct_token
-            return
+        raw_payload = payload.strip()
+        if raw_payload[:1] not in ("{", "["):
+            direct_token = _extract_access_token_from_text(raw_payload)
+            if direct_token and not shared["access_token"]:
+                shared["access_token"] = direct_token
+                return
         try:
-            payload = json.loads(payload)
+            payload = json.loads(raw_payload)
         except Exception:
             return
 
@@ -401,9 +450,12 @@ def check_cookies(window):
     def on_request(request):
         headers = getattr(request, "headers", {}) or {}
         for name, value in headers.items():
-            if str(name).lower() in ("client-token", "x-spotify-client-token"):
+            lowered_name = str(name).lower()
+            if lowered_name in ("authorization", "x-authorization"):
+                _remember_authorization_header(shared, value)
+            if lowered_name in ("client-token", "x-spotify-client-token"):
                 _remember_client_token(shared, f"client-token: {value}")
-            if str(name).lower() == "cookie":
+            if lowered_name == "cookie":
                 _remember_cookie_header(shared, value)
 
     def on_response(response):
@@ -443,14 +495,34 @@ def check_cookies(window):
     window.events.shown += on_shown
 
     token_found_at = None
+    cookie_token_checked_at = 0
+    last_progress_log_at = 0
+    last_login_error_log_at = 0
 
     for _ in range(120):
         remember_url()
+        if time.time() - last_progress_log_at >= 10:
+            last_progress_log_at = time.time()
+            _debug(
+                "Aguardando captura; "
+                f"url={shared['last_url'] or 'desconhecida'}; "
+                f"sp_dc={'sim' if shared['sp_dc'] else 'nao'}; "
+                f"token={'sim' if shared['access_token'] else 'nao'}"
+            )
 
         try:
             page_text = str(window.evaluate_js("document.body ? document.body.innerText : ''") or "").lower()
+            current_url_lower = str(shared["last_url"] or "").lower()
+            if (
+                "errorgoogleaccount" in current_url_lower
+                or "ops! algo deu errado" in page_text
+                or "algo deu errado" in page_text
+            ):
+                if time.time() - last_login_error_log_at >= 10:
+                    last_login_error_log_at = time.time()
+                    _debug("Spotify mostrou erro de login; mantendo a janela aberta para nova tentativa.")
             if "no healthy upstream" in page_text:
-                window.load_url("https://open.spotify.com/")
+                window.load_url(LOGIN_URL)
                 time.sleep(2)
                 continue
         except Exception:
@@ -476,12 +548,64 @@ def check_cookies(window):
             except Exception:
                 pass
 
+        if not shared["access_token"] and (shared["sp_dc"] or shared["cookie_header"]):
+            if time.time() - cookie_token_checked_at >= 6:
+                cookie_token_checked_at = time.time()
+                try:
+                    from services import spotify as _spotify_service
+
+                    fresh_token = _spotify_service.get_token_via_sp_dc(
+                        sp_dc=shared["sp_dc"],
+                        cookie_header=shared["cookie_header"] or None,
+                    )
+                    if fresh_token:
+                        shared["access_token"] = fresh_token
+                        token_found_at = time.time()
+                    _debug("Token obtido pelo cookie da janela.")
+                except Exception as cookie_exc:
+                    _debug(f"Cookie ainda nao gerou token: {cookie_exc}")
+
         if shared["access_token"]:
             if token_found_at is None:
                 token_found_at = time.time()
 
             if not shared["client_token"] and time.time() - token_found_at < 5:
                 time.sleep(1)
+                continue
+
+            # Validate the token is not anonymous by calling /v1/me
+            import requests as _req
+            try:
+                _validate_resp = _req.get(
+                    "https://api.spotify.com/v1/me",
+                    headers={"Authorization": f"Bearer {shared['access_token']}"},
+                    timeout=8,
+                )
+                if _validate_resp.status_code == 401 or _validate_resp.status_code == 403:
+                    # Token is anonymous or invalid — reject and keep waiting
+                    print(f"[Spotify WebView] Token rejeitado (HTTP {_validate_resp.status_code}) — aguardando login real...", flush=True)
+                    shared["access_token"] = ""
+                    token_found_at = None
+                    time.sleep(2)
+                    continue
+                if _validate_resp.status_code == 200:
+                    _user_data = _validate_resp.json()
+                    shared["display_name"] = _user_data.get("display_name") or _user_data.get("id") or ""
+                    shared["avatar"] = (_user_data.get("images") or [{}])[0].get("url", "")
+                    _debug(f"Token validado; conta={shared['display_name'] or 'sem nome'}")
+                else:
+                    if _validate_resp.status_code == 429:
+                        _debug("Spotify pediu pausa ao confirmar login; mantendo a janela aberta.")
+                        time.sleep(8)
+                    else:
+                        _debug(f"Token ainda nao confirmou login real (HTTP {_validate_resp.status_code}); aguardando.")
+                        shared["access_token"] = ""
+                        token_found_at = None
+                        time.sleep(2)
+                    continue
+            except Exception as _val_exc:
+                _debug(f"Erro ao validar token: {_val_exc}")
+                time.sleep(2)
                 continue
 
             print(
@@ -493,6 +617,8 @@ def check_cookies(window):
                         "expires_at": shared["expires_at"],
                         "sp_dc": shared["sp_dc"],
                         "cookie_header": shared["cookie_header"],
+                        "display_name": shared.get("display_name", ""),
+                        "avatar": shared.get("avatar", ""),
                     },
                     ensure_ascii=False,
                 ),
@@ -518,6 +644,7 @@ def check_cookies(window):
 
 
 if __name__ == "__main__":
+    storage_path = tempfile.mkdtemp(prefix="playtransfer_spotify_login_")
     window = webview.create_window(
         title=WINDOW_TITLE,
         url=LOGIN_URL,
@@ -527,4 +654,12 @@ if __name__ == "__main__":
         on_top=True,
         focus=True,
     )
-    webview.start(check_cookies, window, private_mode=False)
+    threading.Thread(
+        target=lambda: (time.sleep(2), check_cookies(window)),
+        daemon=True,
+    ).start()
+    webview.start(
+        private_mode=False,
+        storage_path=storage_path,
+        user_agent=CHROME_USER_AGENT,
+    )

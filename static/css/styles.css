@@ -1319,7 +1319,7 @@ body.modal-open { overflow: hidden; }
   accent-color: var(--brand-primary);
 }
 .consent-actions {
-  display: flex; justify-content: flex-end; gap: 12px;
+  display: flex; justify-content: flex-end; gap: 12px; flex-wrap: wrap;
 }
 .consent-actions .btn {
   justify-content: center;
@@ -1329,6 +1329,16 @@ body.modal-open { overflow: hidden; }
   cursor: not-allowed;
   transform: none;
   filter: none;
+}
+.setup-field {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.setup-field span {
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--color-text);
 }
 
 @media (max-width: 640px) {

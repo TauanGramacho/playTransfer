@@ -57,12 +57,18 @@ async function loadPlatforms() {
 // ── OAuth message listener (popup → parent) ─────────────────
 function listenOAuthMessages() {
   window.addEventListener('message', (evt) => {
-    if (evt.origin !== location.origin) return;
+    if (!isAllowedOAuthMessageOrigin(evt.origin)) return;
     const d = evt.data;
     if (d.type !== 'oauth_done') return;
 
     if (d.error) {
-      showToast(`Erro ao conectar: ${d.error}`, 'error');
+      const platform = d.platform || 'spotify';
+      const role = d.role || 'dest';
+      const message = humanizePlatformError(d.error);
+      const status = document.getElementById(`${role}-${platform}-status`);
+      if (status) status.textContent = message;
+      if (platform === 'spotify') resetSpotifyAutoBtn(role);
+      showToast(message, 'error');
       return;
     }
 
@@ -244,7 +250,7 @@ function makeConnectionStatus(platform, role, displayName) {
   return div;
 }
 
-const OPTIONAL_SOURCE_CONNECTIONS = new Set(['deezer', 'youtube', 'soundcloud', 'apple']);
+const OPTIONAL_SOURCE_CONNECTIONS = new Set(['spotify', 'deezer', 'youtube', 'soundcloud', 'apple']);
 
 
 function isSourceReady() {
@@ -788,6 +794,23 @@ function autoConnectSoundcloud(role) {
   });
 }
 
+function isAllowedOAuthMessageOrigin(origin) {
+  if (origin === location.origin) return true;
+  try {
+    const incoming = new URL(origin);
+    const current = new URL(location.origin);
+    const localHosts = new Set(['localhost', '127.0.0.1']);
+    return (
+      localHosts.has(incoming.hostname) &&
+      localHosts.has(current.hostname) &&
+      incoming.port === current.port &&
+      incoming.protocol === current.protocol
+    );
+  } catch {
+    return false;
+  }
+}
+
 function autoConnectApple(role) {
   return autoConnectSavedAccess({
     platform: 'apple',
@@ -1087,6 +1110,7 @@ function makeSpotifyQuickConnect(role) {
   const connected = (role === 'src' && state.srcSid) || (role === 'dest' && state.destSid);
   const displayName = role === 'src' ? state.srcDisplayName : state.destDisplayName;
   const oauthConfigured = !!state.platforms.spotify?.oauth_configured;
+  const needsOfficialDestSetup = role === 'dest' && !oauthConfigured;
   const autoTrying = !!state.spotifyAutoConnecting?.[role];
 
   if (connected && displayName) {
@@ -1099,13 +1123,23 @@ function makeSpotifyQuickConnect(role) {
     });
   }
 
-  const subtitle = oauthConfigured
+  const subtitle = needsOfficialDestSetup
+    ? 'O Spotify exige uma configuracao oficial unica para criar playlists sem bloquear.'
+    : oauthConfigured
     ? 'Clique no botao abaixo. O app abre o login oficial do Spotify e termina a conexao sozinho.'
     : 'Clique no botao abaixo. O app tenta encontrar seu login do Spotify automaticamente e, se precisar, abre uma janela guiada para concluir.';
 
-  const hint = oauthConfigured
+  const hint = needsOfficialDestSetup
+    ? 'Isto e setup do PlayTransfer. Depois de ativado, o usuario final so toca em conectar.'
+    : oauthConfigured
     ? 'Depois da autorizacao no Spotify, esta tela continua sozinha.'
-    : 'Se o Spotify ja estiver aberto e logado nesta maquina, o app tenta aproveitar isso sozinho. Se nao achar, abre uma janela segura de login.';
+    : 'Uma janela limpa do Spotify abre para voce entrar na conta certa. Se sua conta usa Google, Apple ou Facebook, use esse botao na propria janela.';
+
+  const buttonLabel = autoTrying
+    ? '<span class="spin-inline"></span> Conectando...'
+    : needsOfficialDestSetup
+      ? '🔐 Ativar login oficial do Spotify'
+      : '🔌 Conectar Spotify automaticamente';
 
   return makeFormPanel(`
     <div class="manual-connect-header deezer-quick-header">
@@ -1119,7 +1153,7 @@ function makeSpotifyQuickConnect(role) {
     </div>
     <div class="manual-connect-actions deezer-quick-actions">
       <button class="btn btn-primary btn-sm deezer-auto-connect-btn" type="button" id="${role}-spotify-auto-btn" onclick="autoConnectSpotify('${role}')" ${autoTrying ? 'disabled' : ''}>
-        ${autoTrying ? '<span class="spin-inline"></span> Conectando...' : '🔌 Conectar Spotify automaticamente'}
+        ${buttonLabel}
       </button>
     </div>
     <div class="deezer-quick-hint" id="${role}-spotify-hint">${hint}</div>
@@ -1151,49 +1185,6 @@ function makeAutomaticConnectPanel(config) {
 
 function makeSpotifyForm(role) {
   const wrapper = document.createElement('div');
-  if (role === 'src' && state.platforms.spotify?.oauth_configured) {
-    wrapper.appendChild(makeOAuthForm('spotify', role));
-    wrapper.appendChild(makeAdvancedDetails(
-      'Estou com problema no login rapido',
-      makeManualCredentialsForm({
-        platform: 'spotify',
-        role,
-        title: 'Copie o valor do Spotify',
-        subtitle: role === 'src'
-          ? 'Use isso apenas se o login oficial nao abrir e voce realmente precisar continuar agora.'
-          : 'Use isso apenas se o login oficial nao abrir e voce realmente precisar continuar agora.',
-        badges: ['Sem senha aqui', 'Copie 1 valor', 'Cole e siga'],
-        notice: {
-          title: 'Onde clicar',
-          body: 'No Spotify Web, abra <strong>F12</strong> e depois <strong>Application &gt; Cookies &gt; https://open.spotify.com</strong>.',
-        },
-        label: 'Cole aqui o valor copiado ou o cabecalho Cookie completo',
-        inputId: `${role}-spotify-cookie`,
-        placeholder: 'Cole o Cookie Value de sp_dc ou o cabecalho Cookie completo',
-        statusId: `${role}-spotify-status`,
-        action: 'connectSpotify',
-        buttonLabel: 'Conectar Spotify',
-        help: 'Esse modo e avancado. Para a maioria das pessoas, o recomendado e usar "Entrar e autorizar".',
-        steps: [
-          {
-            title: 'Abra o Spotify Web',
-            detail: 'Entre na conta certa e deixe a pagina aberta.',
-          },
-          {
-            title: 'Abra os dados do site',
-            detail: 'Pressione <kbd>F12</kbd> e clique em <strong>Application</strong> ou <strong>Armazenamento</strong>. Depois entre em <strong>Cookies</strong> e escolha <code>https://open.spotify.com</code>.',
-          },
-          {
-            title: 'Copie o valor certo',
-            detail: 'Clique em <code>sp_dc</code> e copie o texto que aparece em <strong>Cookie Value</strong>.',
-            hint: 'Se ficar mais facil, voce tambem pode colar o cabecalho completo <code>Cookie</code> de uma requisicao do Spotify Web.',
-          },
-        ],
-      })
-    ));
-    return wrapper;
-  }
-
   if (role === 'src') {
     wrapper.appendChild(makeConnectCallout({
       platform: 'spotify',
@@ -1201,8 +1192,17 @@ function makeSpotifyForm(role) {
       badge: 'Sem login',
       title: 'Cole o link do Spotify e continue',
       subtitle: 'Para playlists publicas menores, voce nao precisa entrar nem copiar nada.',
-      note: 'Playlists privadas ou maiores ainda nao estao disponiveis completas nesta instalacao.',
+      note: 'Se a playlist for privada ou muito grande, o login opcional fica logo abaixo.',
     }));
+
+    if (state.platforms.spotify?.oauth_configured) {
+      wrapper.appendChild(makeAdvancedDetails(
+        'Playlist privada ou muito grande? Entrar no Spotify',
+        makeOAuthForm('spotify', role),
+        false
+      ));
+    }
+
     return wrapper;
   }
 
@@ -2759,6 +2759,193 @@ function openBrowserCookieConsent(platform, role) {
   setTimeout(() => checkbox.focus(), 30);
 }
 
+function getSpotifyRedirectUri() {
+  return state.platforms.spotify?.oauth_redirect_uri || `${getSpotifySetupOrigin()}/auth/spotify/callback`;
+}
+
+function getSpotifySetupOrigin() {
+  const url = new URL(location.href);
+  if (url.hostname === 'localhost' || url.hostname === '0.0.0.0') {
+    url.hostname = '127.0.0.1';
+  }
+  url.pathname = '';
+  url.search = '';
+  url.hash = '';
+  return url.origin;
+}
+
+async function refreshSpotifyRedirectConfig() {
+  try {
+    const r = await fetch('/api/config/spotify-redirect');
+    const d = await r.json();
+    if (d.ok && d.redirect_uri) {
+      state.platforms.spotify = {
+        ...(state.platforms.spotify || {}),
+        oauth_redirect_uri: d.redirect_uri,
+      };
+      return d.redirect_uri;
+    }
+  } catch {}
+  return getSpotifyRedirectUri();
+}
+
+function ensureSpotifyOAuthSetupModal() {
+  let modal = document.getElementById('spotify-oauth-setup-modal');
+  if (modal) {
+    return modal;
+  }
+
+  modal = document.createElement('div');
+  modal.id = 'spotify-oauth-setup-modal';
+  modal.className = 'modal-backdrop consent-modal-backdrop';
+  modal.setAttribute('aria-hidden', 'true');
+  modal.innerHTML = `
+    <div class="modal consent-modal" role="dialog" aria-modal="true" aria-labelledby="spotify-oauth-setup-title">
+      <button type="button" class="modal-close" id="spotify-oauth-setup-close" aria-label="Fechar">×</button>
+      <div class="consent-platform-card">
+        <div class="consent-platform-icon">${PLATFORM_ICONS.spotify || ''}</div>
+        <div>
+          <div class="consent-platform-label">Setup do PlayTransfer</div>
+          <div class="consent-platform-role">Login oficial do Spotify</div>
+        </div>
+      </div>
+      <h2 id="spotify-oauth-setup-title">Ativar Spotify oficial</h2>
+      <p>Essa etapa e feita uma vez por quem instala o PlayTransfer. O usuario final nao precisa ver isso depois.</p>
+      <div class="consent-points">
+        <div class="consent-point">
+          <span class="consent-point-mark">1</span>
+          <span>Abra o painel do Spotify, crie um app e entre em <strong>Settings</strong>.</span>
+        </div>
+        <div class="consent-point">
+          <span class="consent-point-mark">2</span>
+          <span>Em <strong>Redirect URIs</strong>, cole o link abaixo e salve. Ele nao e para abrir; e so o caminho de retorno do login.</span>
+        </div>
+        <div class="consent-point">
+          <span class="consent-point-mark">3</span>
+          <span>Copie o <strong>Client ID</strong> do app Spotify e cole aqui. Nao precisa de Client Secret.</span>
+        </div>
+      </div>
+      <label class="setup-field">
+        <span>Redirect URI para copiar no Spotify</span>
+        <input class="form-input" id="spotify-oauth-redirect-uri" readonly />
+      </label>
+      <label class="setup-field">
+        <span>Client ID do Spotify</span>
+        <input class="form-input" id="spotify-oauth-client-id" autocomplete="off" placeholder="Cole o Client ID aqui" />
+      </label>
+      <div class="connect-inline-status" id="spotify-oauth-setup-status"></div>
+      <div class="consent-actions">
+        <button type="button" class="btn btn-secondary" id="spotify-oauth-open-dashboard">Abrir painel do Spotify</button>
+        <button type="button" class="btn btn-secondary" id="spotify-oauth-copy-redirect">Copiar Redirect URI</button>
+        <button type="button" class="btn btn-primary" id="spotify-oauth-save">Salvar e conectar</button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  const close = () => closeSpotifyOAuthSetupModal();
+  modal.querySelector('#spotify-oauth-setup-close')?.addEventListener('click', close);
+  modal.addEventListener('click', (event) => {
+    if (event.target === modal) close();
+  });
+  modal.querySelector('#spotify-oauth-copy-redirect')?.addEventListener('click', async () => {
+    const redirectUri = modal.querySelector('#spotify-oauth-redirect-uri')?.value || getSpotifyRedirectUri();
+    try {
+      await navigator.clipboard.writeText(redirectUri);
+      showToast('Redirect URI copiada.', 'success');
+    } catch {
+      showToast('Nao consegui copiar automaticamente. Selecione e copie o texto.', 'warn');
+    }
+  });
+  modal.querySelector('#spotify-oauth-open-dashboard')?.addEventListener('click', () => {
+    window.open('https://developer.spotify.com/dashboard', '_blank', 'noopener');
+  });
+  modal.querySelector('#spotify-oauth-save')?.addEventListener('click', () => saveSpotifyOAuthSetup());
+
+  return modal;
+}
+
+function openSpotifyOAuthSetupModal(role = 'dest') {
+  const modal = ensureSpotifyOAuthSetupModal();
+  modal.dataset.role = role;
+  modal.querySelector('#spotify-oauth-redirect-uri').value = getSpotifyRedirectUri();
+  modal.querySelector('#spotify-oauth-client-id').value = '';
+  modal.querySelector('#spotify-oauth-setup-status').textContent = '';
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('modal-open');
+  refreshSpotifyRedirectConfig().then((redirectUri) => {
+    const input = modal.querySelector('#spotify-oauth-redirect-uri');
+    if (input) input.value = redirectUri;
+  });
+  setTimeout(() => modal.querySelector('#spotify-oauth-client-id')?.focus(), 30);
+}
+
+function closeSpotifyOAuthSetupModal() {
+  const modal = document.getElementById('spotify-oauth-setup-modal');
+  if (!modal) return;
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+  document.body.classList.remove('modal-open');
+}
+
+async function saveSpotifyOAuthSetup() {
+  const modal = ensureSpotifyOAuthSetupModal();
+  const role = modal.dataset.role || 'dest';
+  const clientId = modal.querySelector('#spotify-oauth-client-id')?.value?.trim() || '';
+  const clientSecret = '';
+  const status = modal.querySelector('#spotify-oauth-setup-status');
+  const saveBtn = modal.querySelector('#spotify-oauth-save');
+
+  if (!clientId) {
+    if (status) status.textContent = 'Cole o Client ID do app Spotify antes de continuar.';
+    return;
+  }
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<span class="spin-inline"></span> Salvando...';
+  }
+  if (status) status.textContent = 'Salvando configuracao local...';
+
+  try {
+    const r = await fetch('/api/config/spotify-oauth', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        client_id: clientId,
+        client_secret: clientSecret,
+        base_url: getSpotifySetupOrigin(),
+      }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      throw new Error(d.error || 'Nao foi possivel ativar o Spotify oficial.');
+    }
+
+    state.platforms.spotify = {
+      ...(state.platforms.spotify || {}),
+      oauth_configured: true,
+      oauth_mode: d.oauth_mode || 'pkce',
+      oauth_redirect_uri: d.oauth_redirect_uri || getSpotifyRedirectUri(),
+    };
+    closeSpotifyOAuthSetupModal();
+    showToast('Spotify oficial ativado. Abrindo login agora.', 'success');
+    renderConnectForms();
+    setTimeout(() => openOAuthPopup('spotify', role), 250);
+  } catch (error) {
+    const message = humanizePlatformError(error?.message || 'Nao foi possivel salvar a configuracao do Spotify.');
+    if (status) status.textContent = message;
+    showToast(message, 'error');
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Salvar e conectar';
+    }
+  }
+}
+
 function humanizePlatformError(message) {
   const raw = String(message || '').trim();
   if (!raw) {
@@ -2798,8 +2985,36 @@ function humanizePlatformError(message) {
     return 'O login automatico do Spotify ainda nao foi ativado nesta instalacao.';
   }
 
-  if (lowered.includes('spotify ainda esta pausando essa sessao')) {
-    return raw;
+  if (lowered.includes('spotify_oauth_required_for_destination')) {
+    return 'Para usar Spotify como destino, falta configurar o login oficial do Spotify no PlayTransfer. Depois disso, o usuario conecta com um clique.';
+  }
+
+  if (lowered.includes('spotify_destination_requires_oauth_reconnect')) {
+    return 'Reconecte o Spotify pelo login oficial antes de transferir para ele. O login antigo por navegador nao consegue criar playlist com estabilidade.';
+  }
+
+  if (lowered.includes('spotify_profile_failed')) {
+    return 'O Spotify autorizou, mas nao devolveu os dados da conta. Tente conectar novamente pelo login oficial.';
+  }
+
+  if (lowered.includes('token_exchange_failed')) {
+    return 'O Spotify abriu o login oficial, mas a troca de autorizacao falhou. Confira o Client ID e a Redirect URI configurados no Spotify Developer Dashboard.';
+  }
+
+  if (lowered.includes('spotify recusou o login nessa janela')) {
+    return 'O Spotify recusou o login nessa janela. Use o botao Google/Apple/Facebook se essa conta foi criada assim; para resolver de vez, o app precisa usar o login oficial OAuth do Spotify no navegador.';
+  }
+
+  if (lowered.includes('sessao do spotify expirou') || lowered.includes('nao foi possivel renovar')) {
+    return 'A sessao do Spotify expirou. Reconecte o Spotify e tente a transferencia novamente.';
+  }
+
+  if (lowered.includes('spotify ainda esta pausando essa sessao') || lowered.includes('spotify ainda esta pausando esta conta')) {
+    return 'O Spotify esta limitando essa conta agora. Aguarde alguns minutos e tente transferir novamente.';
+  }
+
+  if (lowered.includes('http 403') || lowered.includes('bloqueou a criacao da playlist com esta sessao')) {
+    return 'O Spotify bloqueou essa operacao com a sessao atual (erro 403). Tente reconectar o Spotify usando o login oficial OAuth.';
   }
 
   if (
@@ -2967,7 +3182,7 @@ function renderPlatformGrids() {
 }
 
 function isSourceConnectionOptional(platform) {
-  return OPTIONAL_SOURCE_CONNECTIONS.has(platform) || (platform === 'spotify' && !state.platforms.spotify?.oauth_configured);
+  return OPTIONAL_SOURCE_CONNECTIONS.has(platform);
 }
 
 function updateUrlHint() {
@@ -2982,12 +3197,10 @@ function updateUrlHint() {
   };
 
   let hint = hints[state.srcPlatform] || 'Cole o link completo da playlist.';
-  if (state.srcPlatform === 'spotify' && !state.platforms.spotify?.oauth_configured) {
-    hint += ' Playlists publicas menores funcionam direto; playlists privadas ou maiores ainda nao estao disponiveis por completo aqui.';
+  if (state.srcPlatform === 'spotify') {
+    hint += ' Playlists publicas menores funcionam direto sem login.';
   } else if (isSourceConnectionOptional(state.srcPlatform)) {
     hint += ' Para playlists publicas, voce pode pular o login da origem.';
-  } else if (state.srcPlatform === 'spotify') {
-    hint += ' Se a playlist for privada ou muito grande, entre no Spotify antes.';
   }
 
   const el = document.getElementById('url-hint');
@@ -3062,6 +3275,13 @@ async function autoConnectSpotify(role) {
     return;
   }
 
+  if (role === 'dest') {
+    if (status) status.textContent = 'Vamos ativar o login oficial do Spotify nesta instalacao.';
+    if (hint) hint.textContent = 'Cole o Client ID uma vez. Depois o usuario final nao ve mais essa etapa.';
+    openSpotifyOAuthSetupModal(role);
+    return;
+  }
+
   state.spotifyAutoConnecting = state.spotifyAutoConnecting || {};
   state.spotifyAutoConnecting[role] = true;
 
@@ -3071,10 +3291,10 @@ async function autoConnectSpotify(role) {
   }
 
   if (status) {
-    status.innerHTML = '<span class="spin-inline"></span> Abrindo uma janela segura de login do Spotify...';
+    status.innerHTML = '<span class="spin-inline"></span> Abrindo uma janela limpa de login do Spotify...';
   }
   if (hint) {
-    hint.textContent = 'Uma janela chamada "Login Spotify - PlayTransfer" deve abrir agora. Entre nela se precisar e ela fecha sozinha quando a conexao der certo.';
+    hint.textContent = 'Entre na conta do Spotify que vai receber a playlist. Se aparecer erro, tente Google/Apple/Facebook na propria janela ou feche para tentar de novo.';
   }
 
   try {
@@ -3106,9 +3326,9 @@ async function pollSpotifyAutoConnect(role, attempt = 0) {
 
     if (d.status === 'pending') {
       if (status) {
-        status.innerHTML = '<span class="spin-inline"></span> Aguardando voce concluir o login na janela "Login Spotify - PlayTransfer"...';
+        status.innerHTML = '<span class="spin-inline"></span> Aguardando o login do Spotify. Se a janela mostrar erro, tente outro metodo de entrada nela.';
       }
-    } else if (d.status === 'captured' && d.access_token) {
+    } else if (d.status === 'captured' && (d.access_token || d.cookie_header || d.sp_dc)) {
       if (input && (d.cookie_header || d.sp_dc)) input.value = d.cookie_header || d.sp_dc;
       if (status) {
         status.innerHTML = '<span class="spin-inline"></span> Login capturado! Confirmando conexao...';
@@ -3116,12 +3336,14 @@ async function pollSpotifyAutoConnect(role, attempt = 0) {
 
       const success = await connectSpotify(
         role,
-        d.access_token ? {
+        (d.access_token || d.cookie_header || d.sp_dc) ? {
           access_token: d.access_token,
           trusted_webview: true,
           client_token: d.client_token || '',
           sp_dc: d.sp_dc || '',
           cookie_header: d.cookie_header || '',
+          display_name: d.display_name || '',
+          avatar: d.avatar || '',
         } : null
       );
       if (success) {
