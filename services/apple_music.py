@@ -8,32 +8,73 @@ import requests
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-API_BASE = "https://api.music.apple.com/v1"
+API_BASE = "https://amp-api.music.apple.com/v1"
+API_FALLBACK_BASE = "https://amp-api-edge.music.apple.com/v1"
 
 
-def _headers(developer_token: str, music_user_token: str | None = None) -> dict:
+def _request(method: str, path: str, **kwargs):
+    last_response = None
+    last_error = None
+    for base_url in (API_BASE, API_FALLBACK_BASE):
+        try:
+            response = requests.request(method, f"{base_url}{path}", timeout=15, **kwargs)
+            last_response = response
+            if response.status_code >= 500:
+                continue
+            return response
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_response is not None:
+        return last_response
+    raise last_error or RuntimeError("Apple Music API indisponivel.")
+
+
+def _headers(
+    developer_token: str,
+    music_user_token: str | None = None,
+    cookie_header: str | None = None,
+) -> dict:
     headers = {
         "Authorization": f"Bearer {developer_token}",
         "Accept": "application/json",
         "Content-Type": "application/json",
         "User-Agent": UA,
+        "Origin": "https://music.apple.com",
+        "Referer": "https://music.apple.com/",
     }
     if music_user_token:
         headers["Music-User-Token"] = music_user_token
+        headers["media-user-token"] = music_user_token
+    if cookie_header:
+        headers["Cookie"] = cookie_header
     return headers
 
 
-def validate(developer_token: str, music_user_token: str, storefront: str = "us") -> dict:
+def _params(base: dict | None = None, itfe: str | None = None) -> dict:
+    params = dict(base or {})
+    if itfe:
+        params["itfe"] = itfe
+    return params
+
+
+def validate(
+    developer_token: str,
+    music_user_token: str,
+    storefront: str = "us",
+    cookie_header: str | None = None,
+    itfe: str | None = None,
+) -> dict:
     if not developer_token:
         raise ValueError("Developer token da Apple Music não fornecido.")
     if not music_user_token:
         raise ValueError("Music user token da Apple Music não fornecido.")
 
-    r = requests.get(
-        f"{API_BASE}/me/library/playlists",
-        headers=_headers(developer_token, music_user_token),
-        params={"limit": 1, "l": "pt-BR"},
-        timeout=15,
+    r = _request(
+        "GET",
+        "/me/library/playlists",
+        headers=_headers(developer_token, music_user_token, cookie_header),
+        params=_params({"limit": 1, "l": "pt-BR"}, itfe),
     )
     if r.status_code != 200:
         raise ValueError(f"Apple Music rejeitou os tokens (HTTP {r.status_code}).")
@@ -84,8 +125,16 @@ def read_playlist(url: str) -> tuple[str, list[dict]]:
         raise ValueError(f"Apple Music: não foi possível ler a playlist ({e}).")
 
 
-def search_track(developer_token: str, storefront: str, titulo: str, artista: str = "", album: str = "") -> str | None:
-    headers = _headers(developer_token)
+def search_track(
+    developer_token: str,
+    storefront: str,
+    titulo: str,
+    artista: str = "",
+    album: str = "",
+    cookie_header: str | None = None,
+    itfe: str | None = None,
+) -> str | None:
+    headers = _headers(developer_token, cookie_header=cookie_header)
     queries = []
     if artista and album:
         queries.append(f"{artista} {titulo} {album}")
@@ -95,16 +144,16 @@ def search_track(developer_token: str, storefront: str, titulo: str, artista: st
 
     for query in queries:
         try:
-            r = requests.get(
-                f"{API_BASE}/catalog/{storefront}/search",
+            r = _request(
+                "GET",
+                f"/catalog/{storefront}/search",
                 headers=headers,
-                params={
+                params=_params({
                     "term": query,
                     "types": "songs",
                     "limit": 5,
                     "l": "pt-BR",
-                },
-                timeout=15,
+                }, itfe),
             )
             if r.status_code != 200:
                 continue
@@ -117,17 +166,25 @@ def search_track(developer_token: str, storefront: str, titulo: str, artista: st
     return None
 
 
-def create_playlist(developer_token: str, music_user_token: str, nome: str, descricao: str = "") -> str:
-    r = requests.post(
-        f"{API_BASE}/me/library/playlists",
-        headers=_headers(developer_token, music_user_token),
+def create_playlist(
+    developer_token: str,
+    music_user_token: str,
+    nome: str,
+    descricao: str = "",
+    cookie_header: str | None = None,
+    itfe: str | None = None,
+) -> str:
+    r = _request(
+        "POST",
+        "/me/library/playlists",
+        headers=_headers(developer_token, music_user_token, cookie_header),
+        params=_params({}, itfe),
         json={
             "attributes": {
                 "name": nome,
                 "description": descricao or "Transferida via PlayTransfer",
             }
         },
-        timeout=15,
     )
     if r.status_code not in (200, 201):
         raise ValueError(f"Não foi possível criar playlist na Apple Music (HTTP {r.status_code}).")
@@ -138,18 +195,26 @@ def create_playlist(developer_token: str, music_user_token: str, nome: str, desc
     return playlist_id
 
 
-def add_tracks(developer_token: str, music_user_token: str, playlist_id: str, track_ids: list[str]) -> None:
+def add_tracks(
+    developer_token: str,
+    music_user_token: str,
+    playlist_id: str,
+    track_ids: list[str],
+    cookie_header: str | None = None,
+    itfe: str | None = None,
+) -> None:
     if not track_ids:
         return
 
-    headers = _headers(developer_token, music_user_token)
+    headers = _headers(developer_token, music_user_token, cookie_header)
     for i in range(0, len(track_ids), 100):
         chunk = track_ids[i:i + 100]
-        r = requests.post(
-            f"{API_BASE}/me/library/playlists/{playlist_id}/tracks",
+        r = _request(
+            "POST",
+            f"/me/library/playlists/{playlist_id}/tracks",
             headers=headers,
+            params=_params({}, itfe),
             json={"data": [{"id": track_id, "type": "songs"} for track_id in chunk]},
-            timeout=15,
         )
         if r.status_code not in (200, 201, 202, 204):
             raise ValueError(f"Erro ao adicionar faixas na Apple Music (HTTP {r.status_code}).")

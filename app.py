@@ -2,7 +2,7 @@
 app.py — PlayTransfer
 Servidor Flask principal — OAuth + API REST + worker threads
 """
-import base64, hashlib, json, os, subprocess, sys, tempfile, time, threading, traceback, secrets, urllib.parse
+import base64, hashlib, json, os, re, subprocess, sys, tempfile, time, threading, traceback, secrets, urllib.parse
 import requests as req_lib
 from flask import Flask, render_template, request, jsonify, redirect, session, abort
 from dotenv import load_dotenv
@@ -29,8 +29,11 @@ youtube_logins: dict[str, dict] = {}
 youtube_guided_logins: dict[str, dict] = {}
 spotify_browser_guided: dict[str, dict] = {}
 deezer_browser_guided: dict[str, dict] = {}
+apple_browser_guided: dict[str, dict] = {}
 
 BASE_URL = os.getenv("BASE_URL", "").strip()
+APPLE_MUSIC_BOOTSTRAP_CACHE = {"token": "", "expires_at": 0.0, "source": ""}
+APPLE_MUSIC_BOOTSTRAP_LOCK = threading.Lock()
 
 INFO_PAGES = {
     "sobre": {
@@ -250,6 +253,108 @@ def _write_env_values(updates: dict[str, str]) -> None:
 
 def _looks_like_spotify_client_id(value: str) -> bool:
     return 20 <= len(value) <= 80 and all(char.isalnum() for char in value)
+
+
+def _looks_like_jwt(value: str) -> bool:
+    parts = [part for part in str(value or "").strip().split(".") if part]
+    return len(parts) == 3
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    parts = [part for part in str(token or "").strip().split(".") if part]
+    if len(parts) != 3:
+        return {}
+    payload = parts[1]
+    payload += "=" * (-len(payload) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(payload.encode("utf-8"))
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return {}
+
+
+def _jwt_expiry(token: str) -> float:
+    payload = _decode_jwt_payload(token)
+    try:
+        return float(payload.get("exp") or 0)
+    except Exception:
+        return 0.0
+
+
+def _token_has_min_ttl(token: str, min_seconds: int = 120) -> bool:
+    if not _looks_like_jwt(token):
+        return False
+    expiry = _jwt_expiry(token)
+    return expiry > (time.time() + min_seconds)
+
+
+def _extract_apple_web_developer_token(script_text: str) -> str:
+    candidates = re.findall(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", script_text or "")
+    for token in candidates:
+        payload = _decode_jwt_payload(token)
+        issuer = str(payload.get("iss") or "")
+        roots = payload.get("root_https_origin") or []
+        roots_blob = " ".join(str(item) for item in roots)
+        if issuer == "AMPWebPlay" or "apple.com" in roots_blob:
+            if _token_has_min_ttl(token, min_seconds=0):
+                return token
+    return ""
+
+
+def _fetch_apple_web_developer_token() -> str:
+    session = req_lib.Session()
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    page_url = "https://music.apple.com/us/browse"
+    response = session.get(page_url, headers=headers, timeout=20)
+    response.raise_for_status()
+
+    script_paths = re.findall(r'<script[^>]+src="([^"]+)"', response.text or "", flags=re.IGNORECASE)
+    script_urls: list[str] = []
+    for path in script_paths:
+        lower = path.lower()
+        if "/assets/" not in lower or "index" not in lower or ".js" not in lower:
+            continue
+        full_url = urllib.parse.urljoin(page_url, path)
+        if full_url not in script_urls:
+            script_urls.append(full_url)
+
+    # Prefer the modern bundle first, then try the legacy one as fallback.
+    script_urls.sort(key=lambda url: ("legacy" in url.lower(), url))
+
+    for script_url in script_urls[:6]:
+        script_response = session.get(script_url, headers=headers, timeout=20)
+        script_response.raise_for_status()
+        token = _extract_apple_web_developer_token(script_response.text)
+        if token:
+            return token
+
+    raise RuntimeError("apple_musickit_not_configured")
+
+
+def get_apple_music_developer_token(force_refresh: bool = False) -> tuple[str, str]:
+    saved_token = os.environ.get("APPLE_MUSIC_DEVELOPER_TOKEN", "").strip()
+    if saved_token and _token_has_min_ttl(saved_token):
+        return saved_token, "env"
+
+    with APPLE_MUSIC_BOOTSTRAP_LOCK:
+        cached_token = str(APPLE_MUSIC_BOOTSTRAP_CACHE.get("token") or "").strip()
+        if cached_token and not force_refresh and _token_has_min_ttl(cached_token):
+            return cached_token, str(APPLE_MUSIC_BOOTSTRAP_CACHE.get("source") or "apple_web")
+
+        token = _fetch_apple_web_developer_token()
+        APPLE_MUSIC_BOOTSTRAP_CACHE.update({
+            "token": token,
+            "expires_at": _jwt_expiry(token),
+            "source": "apple_web",
+        })
+        return token, "apple_web"
 
 
 @app.route("/api/config/spotify-oauth", methods=["POST"])
@@ -989,6 +1094,183 @@ def connect_deezer_browser_guided_capture():
     return ("", 204)
 
 
+def _run_apple_guided_capture(role: str):
+    attempt = apple_browser_guided.setdefault(role, {})
+    attempt.update({
+        "status": "pending",
+        "error": "",
+        "music_user_token": "",
+        "storefront": "",
+        "cookie_header": "",
+        "itfe": "",
+        "step": "running_webview",
+        "updated_at": time.time(),
+    })
+
+    try:
+        python_exe = sys.executable
+        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apple_webview.py")
+
+        completed = subprocess.run(
+            [python_exe, script_path],
+            capture_output=True,
+            text=True,
+            timeout=210,
+        )
+    except subprocess.TimeoutExpired:
+        attempt.update({
+            "status": "error",
+            "error": "A janela da Apple Music demorou muito e foi encerrada.",
+            "step": "timed_out",
+            "updated_at": time.time(),
+        })
+        return
+    except Exception as exc:
+        attempt.update({
+            "status": "error",
+            "error": f"Erro abrindo a janela da Apple Music: {exc}",
+            "step": "automation_failed",
+            "updated_at": time.time(),
+        })
+        return
+
+    output = completed.stdout or ""
+    error_output = (completed.stderr or "").strip()
+    if completed.returncode not in (0, None):
+        attempt.update({
+            "status": "error",
+            "error": error_output or output.strip() or "Falha ao abrir a janela da Apple Music.",
+            "step": "automation_failed",
+            "updated_at": time.time(),
+        })
+        return
+
+    payload = {}
+    aborted = False
+    timed_out = False
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith("APPLE_FOUND:"):
+            try:
+                payload = json.loads(line.split("APPLE_FOUND:", 1)[1].strip())
+            except Exception:
+                payload = {}
+        elif line.startswith("APPLE_ABORTED:"):
+            aborted = True
+        elif line.startswith("APPLE_TIMEOUT:"):
+            timed_out = True
+
+    music_user_token = str(payload.get("music_user_token") or "").strip()
+    storefront = str(payload.get("storefront") or "us").strip().lower() or "us"
+    cookie_header = str(payload.get("cookie_header") or "").strip()
+    itfe = str(payload.get("itfe") or "").strip()
+
+    if music_user_token and len(music_user_token) > 50:
+        try:
+            from services import apple_music
+            developer_token, _ = get_apple_music_developer_token()
+            apple_music.validate(
+                developer_token,
+                music_user_token,
+                storefront,
+                cookie_header=cookie_header,
+                itfe=itfe,
+            )
+        except Exception as exc:
+            attempt.update({
+                "status": "error",
+                "error": f"apple_music_validation_failed:{exc}",
+                "music_user_token": "",
+                "storefront": storefront,
+                "cookie_header": "",
+                "itfe": "",
+                "step": "validation_failed",
+                "updated_at": time.time(),
+            })
+            return
+
+        attempt.update({
+            "status": "captured",
+            "error": "",
+            "music_user_token": music_user_token,
+            "storefront": storefront,
+            "cookie_header": cookie_header,
+            "itfe": itfe,
+            "step": "captured",
+            "updated_at": time.time(),
+        })
+        return
+
+    if aborted:
+        attempt.update({
+            "status": "error",
+            "error": "Voce fechou a janela da Apple Music antes de concluir o login.",
+            "step": "aborted",
+            "updated_at": time.time(),
+        })
+        return
+
+    if timed_out:
+        attempt.update({
+            "status": "error",
+            "error": "A janela da Apple Music ficou aberta, mas o login nao terminou a tempo.",
+            "step": "timed_out",
+            "updated_at": time.time(),
+        })
+        return
+
+    attempt.update({
+        "status": "error",
+        "error": "missing_apple_user_token",
+        "step": "no_capture",
+        "updated_at": time.time(),
+    })
+
+
+@app.route("/api/connect/apple/browser-guided/start", methods=["POST"])
+def connect_apple_browser_guided_start():
+    data = request.json or {}
+    role = str(data.get("role") or "dest").strip() or "dest"
+    apple_browser_guided[role] = {
+        "status": "pending",
+        "error": "",
+        "music_user_token": "",
+        "storefront": "",
+        "cookie_header": "",
+        "itfe": "",
+        "step": "queued",
+        "updated_at": time.time(),
+    }
+    threading.Thread(target=_run_apple_guided_capture, args=(role,), daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
+@app.route("/api/connect/apple/browser-guided/status")
+def connect_apple_browser_guided_status():
+    role = str(request.args.get("role") or "dest").strip() or "dest"
+    data = apple_browser_guided.get(role) or {
+        "status": "idle",
+        "error": "",
+        "music_user_token": "",
+        "storefront": "",
+        "cookie_header": "",
+        "itfe": "",
+        "step": "idle",
+        "updated_at": 0,
+    }
+    return jsonify({
+        "ok": True,
+        "status": data.get("status", "idle"),
+        "error": data.get("error", ""),
+        "music_user_token": data.get("music_user_token", ""),
+        "storefront": data.get("storefront", ""),
+        "cookie_header": data.get("cookie_header", ""),
+        "itfe": data.get("itfe", ""),
+        "step": data.get("step", "idle"),
+        "updated_at": data.get("updated_at", 0),
+    })
+
+
 @app.route("/api/connect/youtube", methods=["POST"])
 def connect_youtube():
     from services import youtube_music
@@ -1151,26 +1433,99 @@ def connect_apple():
 
     data = request.json or {}
     role = data.get("role", "src")
-    developer_token = (data.get("developer_token") or os.getenv("APPLE_MUSIC_DEVELOPER_TOKEN", "")).strip()
-    music_user_token = (data.get("music_user_token") or os.getenv("APPLE_MUSIC_USER_TOKEN", "")).strip()
-    storefront = (data.get("storefront") or os.getenv("APPLE_MUSIC_STOREFRONT", "us")).strip().lower() or "us"
+    developer_token = (data.get("developer_token") or os.environ.get("APPLE_MUSIC_DEVELOPER_TOKEN", "")).strip()
+    music_user_token = (data.get("music_user_token") or os.environ.get("APPLE_MUSIC_USER_TOKEN", "")).strip()
+    storefront = (data.get("storefront") or os.environ.get("APPLE_MUSIC_STOREFRONT", "us")).strip().lower() or "us"
+    cookie_header = (data.get("cookie_header") or "").strip()
+    itfe = (data.get("itfe") or "").strip()
 
     try:
+        if not developer_token:
+            developer_token, _ = get_apple_music_developer_token()
+
         if role == "src" and not (developer_token and music_user_token):
             sid = create_session("apple", display_name="Apple Music (pública)", storefront=storefront)
             return jsonify({"ok": True, "sid": sid, "display_name": "Apple Music (pública)"})
 
-        info = apple_music.validate(developer_token, music_user_token, storefront)
+        if not developer_token:
+            raise ValueError("apple_musickit_not_configured")
+        if not music_user_token:
+            raise ValueError("apple_music_user_token_required")
+
+        info = apple_music.validate(
+            developer_token,
+            music_user_token,
+            storefront,
+            cookie_header=cookie_header,
+            itfe=itfe,
+        )
         sid = create_session(
             "apple",
             developer_token=developer_token,
             music_user_token=music_user_token,
             storefront=info.get("storefront", storefront),
+            cookie_header=cookie_header,
+            itfe=itfe,
             display_name=info["display_name"],
         )
         return jsonify({"ok": True, "sid": sid, "display_name": info["display_name"]})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
+
+@app.route("/api/config/apple-music")
+def apple_music_config():
+    developer_token = ""
+    bootstrap_source = ""
+    try:
+        developer_token, bootstrap_source = get_apple_music_developer_token()
+    except Exception:
+        developer_token = ""
+        bootstrap_source = ""
+    storefront = os.environ.get("APPLE_MUSIC_STOREFRONT", "us").strip().lower() or "us"
+    return jsonify({
+        "ok": True,
+        "configured": bool(developer_token),
+        "developer_token": developer_token,
+        "storefront": storefront,
+        "bootstrap_source": bootstrap_source,
+    })
+
+
+@app.route("/api/config/apple-music", methods=["POST"])
+def configure_apple_music():
+    data = request.json or {}
+    developer_token = str(data.get("developer_token") or "").strip()
+    storefront = str(data.get("storefront") or "us").strip().lower() or "us"
+
+    if not _looks_like_jwt(developer_token):
+        return jsonify({
+            "ok": False,
+            "error": "Cole um developer token valido da Apple Music. Ele costuma ter tres partes separadas por ponto.",
+        })
+
+    try:
+        _write_env_values({
+            "APPLE_MUSIC_DEVELOPER_TOKEN": developer_token,
+            "APPLE_MUSIC_STOREFRONT": storefront,
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Nao consegui salvar no .env: {exc}"})
+
+    os.environ["APPLE_MUSIC_DEVELOPER_TOKEN"] = developer_token
+    os.environ["APPLE_MUSIC_STOREFRONT"] = storefront
+    APPLE_MUSIC_BOOTSTRAP_CACHE.update({
+        "token": developer_token,
+        "expires_at": _jwt_expiry(developer_token),
+        "source": "env",
+    })
+
+    return jsonify({
+        "ok": True,
+        "configured": True,
+        "developer_token": developer_token,
+        "storefront": storefront,
+    })
 
 # ═════════════════════════════════════════════════════════════════════════════
 # PREVIEW & TRANSFER
@@ -1270,10 +1625,13 @@ def api_platforms():
     p["spotify"]["oauth_redirect_uri"] = build_callback_url("spotify")
     p["deezer"]["oauth_configured"]  = bool(DEEZER_APP_ID and DEEZER_SECRET_KEY)
     p["soundcloud"]["auto_configured"] = bool(os.getenv("SOUNDCLOUD_ACCESS_TOKEN", "").strip())
-    p["apple"]["auto_configured"] = bool(
-        os.getenv("APPLE_MUSIC_DEVELOPER_TOKEN", "").strip()
-        and os.getenv("APPLE_MUSIC_USER_TOKEN", "").strip()
-    )
+    apple_ready = False
+    try:
+        apple_ready = bool(get_apple_music_developer_token()[0])
+    except Exception:
+        apple_ready = False
+    p["apple"]["auto_configured"] = apple_ready
+    p["apple"]["installation_configured"] = p["apple"]["auto_configured"]
     p["amazon"]["auto_configured"] = bool(
         os.getenv("AMAZON_MUSIC_API_KEY", "").strip()
         and os.getenv("AMAZON_MUSIC_ACCESS_TOKEN", "").strip()
@@ -1653,6 +2011,8 @@ def run_transfer(job: dict, data: dict):
             developer_token = dest_sess.get("developer_token", "")
             music_user_token = dest_sess.get("music_user_token", "")
             storefront = dest_sess.get("storefront", "us")
+            cookie_header = dest_sess.get("cookie_header", "")
+            itfe = dest_sess.get("itfe", "")
             if not developer_token or not music_user_token:
                 raise ValueError("Sessão da Apple Music não encontrada. Informe developer token e music user token.")
 
@@ -1661,6 +2021,8 @@ def run_transfer(job: dict, data: dict):
                 music_user_token,
                 nome,
                 "Transferida via PlayTransfer",
+                cookie_header=cookie_header,
+                itfe=itfe,
             )
             dest_url = f"https://music.apple.com/{storefront}/library/playlist/{playlist_id}"
             emit(job, {"type": "status", "msg": "Buscando músicas na Apple Music..."})
@@ -1672,6 +2034,8 @@ def run_transfer(job: dict, data: dict):
                     m["titulo"],
                     m["artista"],
                     m.get("album", ""),
+                    cookie_header=cookie_header,
+                    itfe=itfe,
                 )
                 if track_id:
                     ids_encontrados.append(track_id)
@@ -1683,7 +2047,14 @@ def run_transfer(job: dict, data: dict):
 
             if ids_encontrados:
                 emit(job, {"type": "status", "msg": "Adicionando faixas..."})
-                apple_music.add_tracks(developer_token, music_user_token, playlist_id, ids_encontrados)
+                apple_music.add_tracks(
+                    developer_token,
+                    music_user_token,
+                    playlist_id,
+                    ids_encontrados,
+                    cookie_header=cookie_header,
+                    itfe=itfe,
+                )
 
         elif dest_platform == "tidal":
             from services import tidal
@@ -1772,7 +2143,7 @@ def api_job_status(job_id):
 
 @app.route("/api/health")
 def health():
-    return jsonify({"status": "ok", "version": "1.2.0", "app": "PlayTransfer"})
+    return jsonify({"status": "ok", "version": "1.2.5", "app": "PlayTransfer"})
 
 if __name__ == "__main__":
     import webbrowser
