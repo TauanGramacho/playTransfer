@@ -66,9 +66,14 @@ function listenOAuthMessages() {
       const role = d.role || 'dest';
       const message = humanizePlatformError(d.error);
       const status = document.getElementById(`${role}-${platform}-status`);
-      if (status) status.textContent = message;
+      if (platform === 'amazon' && isAmazonOfficialAccessError(d.error)) {
+        renderAmazonOfficialAccessNotice(role, d.error);
+      } else if (status) {
+        status.textContent = message;
+      }
       if (platform === 'spotify') resetSpotifyAutoBtn(role);
-      showToast(message, 'error');
+      if (platform === 'amazon') resetPlatformAutoButton('amazon', role, 'Tentar novamente');
+      showToast(message, platform === 'amazon' && isAmazonOfficialAccessError(d.error) ? 'warn' : 'error');
       return;
     }
 
@@ -734,8 +739,13 @@ async function connectAmazon(role) {
       return true;
     } else {
       const message = humanizePlatformError(d.error || 'Falha ao conectar Amazon Music');
-      if (status) status.textContent = message;
-      showToast(message, 'error');
+      if (isAmazonOfficialAccessError(d.error || message)) {
+        renderAmazonOfficialAccessNotice(role, d.error || message);
+        showToast(message, 'warn');
+      } else {
+        if (status) status.textContent = message;
+        showToast(message, 'error');
+      }
       return false;
     }
   } catch {
@@ -784,6 +794,18 @@ async function autoConnectSavedAccess(config) {
   return false;
 }
 
+function resetPlatformAutoButton(platform, role, label = '🔌 Tentar novamente') {
+  const key = `${platform}:${role}`;
+  state.platformAutoConnecting = state.platformAutoConnecting || {};
+  state.platformAutoConnecting[key] = false;
+
+  const btn = document.getElementById(`${role}-${platform}-auto-btn`);
+  if (btn) {
+    btn.disabled = false;
+    btn.innerHTML = label;
+  }
+}
+
 function autoConnectSoundcloud(role) {
   return autoConnectSavedAccess({
     platform: 'soundcloud',
@@ -829,15 +851,77 @@ function autoConnectApple(role) {
   });
 }
 
+function amazonMusicApiDocsUrl() {
+  return 'https://developer.amazon.com/docs/music/API_web_overview.html';
+}
+
+function openAmazonMusicApiDocs() {
+  const opened = window.open(amazonMusicApiDocsUrl(), '_blank');
+  try {
+    if (opened) opened.opener = null;
+  } catch {}
+  if (!opened) {
+    showToast('O navegador bloqueou a aba da Amazon. Abra a documentacao pelo link exibido no card.', 'warn');
+  }
+}
+
+function isAmazonOfficialAccessError(message) {
+  const lowered = String(message || '').toLowerCase();
+  return (
+    lowered.includes('amazon_music_api_access_required') ||
+    lowered.includes('amazon_music_api_not_enabled') ||
+    lowered.includes('amazon_music_oauth_required') ||
+    lowered.includes('amazon_lwa_token_exchange_failed') ||
+    lowered.includes('amazon_music_auth_failed') ||
+    lowered.includes('amazon_music_validation_failed') ||
+    lowered.includes('api key do amazon music') ||
+    lowered.includes('access token do amazon music') ||
+    lowered.includes('beta fechado') ||
+    lowered.includes('web api oficial') ||
+    lowered.includes('permissao para esse endpoint do amazon music')
+  );
+}
+
+function renderAmazonOfficialAccessNotice(role, rawMessage = '') {
+  const status = document.getElementById(`${role}-amazon-status`);
+  if (!status) return;
+
+  const configured = !!state.platforms.amazon?.oauth_configured;
+  const notEnabled = String(rawMessage || '').toLowerCase().includes('not_enabled');
+  const copy = configured || notEnabled
+    ? 'A Amazon abriu o caminho oficial, mas ainda nao liberou a criacao de playlists nesta instalacao. Tente novamente mais tarde.'
+    : 'Essa integracao ainda nao esta ativa nesta instalacao. Assim que estiver, este mesmo botao conecta sua conta automaticamente.';
+  status.innerHTML = `
+    <div class="apple-library-unlock">
+      <div class="apple-library-unlock-title">Amazon Music ainda nao disponivel aqui</div>
+      <div class="apple-library-unlock-copy">${copy}</div>
+    </div>
+  `;
+}
+
 function autoConnectAmazon(role) {
+  if (state.platforms.amazon?.oauth_configured) {
+    const status = document.getElementById(`${role}-amazon-status`);
+    if (status) status.innerHTML = '<span class="spin-inline"></span> Abrindo Login With Amazon...';
+    openOAuthPopup('amazon', role);
+    return true;
+  }
+
+  if (!state.platforms.amazon?.auto_configured) {
+    renderAmazonOfficialAccessNotice(role);
+    showToast(humanizePlatformError('amazon_music_api_access_required'), 'warn');
+    resetPlatformAutoButton('amazon', role, 'Conectar Amazon Music');
+    return false;
+  }
+
   return autoConnectSavedAccess({
     platform: 'amazon',
     role,
     name: 'Amazon Music',
     statusId: `${role}-amazon-status`,
-    detailsId: `${role}-amazon-details`,
+    detailsId: '',
     connect: connectAmazon,
-    fallbackMessage: 'Para usar Amazon Music, esta instalacao precisa de acesso oficial da API. Deixei o modo manual aberto abaixo.',
+    fallbackMessage: 'Amazon Music ainda nao esta disponivel nesta instalacao.',
   });
 }
 
@@ -1094,7 +1178,7 @@ function makeOAuthForm(platform, role) {
       tone: 'warning',
       badge: 'Login rapido indisponivel',
       title: `${name} sem login facil nesta instalacao`,
-      subtitle: 'A forma simples de entrar ainda nao esta ativa aqui.',
+      subtitle: 'A forma simples de fazer login ainda nao esta ativa aqui.',
       note: 'Se quiser continuar agora, voce pode usar a opcao avancada logo abaixo.',
     });
   }
@@ -1102,12 +1186,12 @@ function makeOAuthForm(platform, role) {
   return makeConnectCallout({
     platform,
     badge: 'Login oficial',
-    title: `Entrar com ${name}`,
+    title: `Fazer login com ${name}`,
     subtitle: role === 'src'
       ? 'Vamos pedir sua autorizacao para ler a playlist completa do jeito certo.'
       : 'Vamos pedir sua autorizacao para criar a nova playlist na sua conta.',
     note: `Antes de seguir, mostramos rapidinho por que essa permissao e pedida. Sua senha continua no site oficial do ${name}.`,
-    buttonLabel: `Entrar e autorizar`,
+    buttonLabel: `Fazer login e autorizar`,
     buttonAction: `openOAuthPopup('${platform}','${role}')`,
     buttonClass: 'btn btn-primary',
   });
@@ -1140,7 +1224,7 @@ function makeSpotifyQuickConnect(role) {
     ? 'Isto e setup do PlayTransfer. Depois de ativado, o usuario final so toca em conectar.'
     : oauthConfigured
     ? 'Depois da autorizacao no Spotify, esta tela continua sozinha.'
-    : 'Uma janela limpa do Spotify abre para voce entrar na conta certa. Se sua conta usa Google, Apple ou Facebook, use esse botao na propria janela.';
+    : 'Uma janela limpa do Spotify abre para voce fazer login na conta certa. Se sua conta usa Google, Apple ou Facebook, use esse botao na propria janela.';
 
   const buttonLabel = autoTrying
     ? '<span class="spin-inline"></span> Conectando...'
@@ -1204,7 +1288,7 @@ function makeSpotifyForm(role) {
 
     if (state.platforms.spotify?.oauth_configured) {
       wrapper.appendChild(makeAdvancedDetails(
-        'Playlist privada ou muito grande? Entrar no Spotify',
+        'Playlist privada ou muito grande? Fazer login no Spotify',
         makeOAuthForm('spotify', role),
         false
       ));
@@ -1268,7 +1352,7 @@ function makeDeezerForm(role) {
       badge: 'Sem login',
       title: 'Voce nao precisa fazer login no Deezer agora',
       subtitle: 'Para a maioria das playlists publicas, basta colar o link abaixo.',
-      note: 'Se a pre-visualizacao nao abrir, confira se a playlist esta publica.',
+      note: 'Se a visualizacao previa nao abrir, confira se a playlist esta publica.',
     });
   }
 
@@ -1443,7 +1527,7 @@ function makeYoutubeForm(role) {
       badge: 'Sem login',
       title: 'Voce nao precisa fazer login no YouTube Music agora',
       subtitle: 'Se a playlist for publica, basta colar o link abaixo e continuar.',
-      note: 'Se a pre-visualizacao nao abrir, confira se o link esta publico.',
+      note: 'Se a visualizacao previa nao abrir, confira se o link esta publico.',
     });
   }
 
@@ -1578,7 +1662,7 @@ function makeAppleForm(role) {
       role,
       title: 'Conectar Apple Music',
       subtitle: 'Clique no botao abaixo. Para playlists publicas, o app prepara a leitura automaticamente.',
-      hint: 'Se o link for publico, voce nao precisa colocar codigo nenhum.',
+      hint: 'Se o link for publico, voce nao precisa informar codigo nenhum.',
       statusId: `${role}-apple-status`,
       buttonLabel: '🔌 Conectar Apple Music automaticamente',
       action: `autoConnectApple('${role}')`,
@@ -1620,34 +1704,22 @@ function makeAppleForm(role) {
 
 function makeAmazonForm(role) {
   const wrapper = document.createElement('div');
-  const amazonDetails = makeAdvancedDetails(
-    'Nao funcionou? Fazer manualmente',
-    makeFormPanel(`
-      <div class="manual-connect-header">
-        <div class="manual-connect-title">Amazon Music Web API</div>
-        <div class="manual-connect-subtitle">Preencha isso apenas se voce ja recebeu acesso oficial a API.</div>
-      </div>
-      ${makeTextInputField(`${role}-amazon-api-key`, 'Chave do app (API key)', 'amzn1.application-oa2-client...')}
-      ${makeTextAreaField(`${role}-amazon-access-token`, 'Token da conta (access token)', 'Atza|IwEB...')}
-      ${makeTextInputField(`${role}-amazon-country-code`, 'Pais da conta', 'US', 'US')}
-      <button class="btn btn-secondary btn-sm" onclick="connectAmazon('${role}')">Conectar Amazon Music</button>
-      ${makeInlineStatus(`${role}-amazon-status`)}
-    `),
-    false
-  );
-  amazonDetails.id = `${role}-amazon-details`;
+  const apiReady = !!state.platforms.amazon?.auto_configured;
 
   wrapper.appendChild(makeAutomaticConnectPanel({
     platform: 'amazon',
     title: 'Conectar Amazon Music',
     role,
-    subtitle: 'Clique no botao abaixo. Se esta instalacao ja tiver acesso da Amazon salvo, o app conecta em um passo.',
-    hint: 'Se a API da Amazon ainda nao estiver liberada para esta instalacao, o app avisa e deixa o fallback manual escondido abaixo.',
+    subtitle: apiReady
+      ? 'Clique no botao abaixo. O app abre o login oficial da Amazon e conecta a conta em um passo.'
+      : 'O app tenta conectar automaticamente, igual aos outros destinos.',
+    hint: apiReady
+      ? 'Voce nao precisa preencher token, pais da conta ou codigo manual.'
+      : '',
     statusId: `${role}-amazon-status`,
-    buttonLabel: '🔌 Conectar Amazon Music automaticamente',
+    buttonLabel: 'Conectar Amazon Music',
     action: `autoConnectAmazon('${role}')`,
   }));
-  wrapper.appendChild(amazonDetails);
 
   return wrapper;
 }
@@ -1727,7 +1799,7 @@ async function readDeezerCookieFromBrowser(role) {
       const message = humanizePlatformError(d.error || 'Falha ao buscar o Deezer no navegador');
       if (status) {
         if (String(message || '').toLowerCase().includes('chrome')) {
-          status.textContent = `${message} Abrir e entrar no Deezer nao remove essa trava do Chrome. Para continuar agora, use o passo manual logo abaixo.`;
+          status.textContent = `${message} Abrir e fazer login no Deezer nao remove essa trava do Chrome. Para continuar agora, use o passo manual logo abaixo.`;
         } else {
           status.textContent = `${message} O PlayTransfer continua nesta tela. Se precisar, siga pelo passo manual logo abaixo.`;
         }
@@ -2440,7 +2512,7 @@ function checkTransferReady() {
 
 
 function getOAuthConsentCopy(platform, role) {
-  const names = { spotify: 'Spotify', deezer: 'Deezer' };
+  const names = { spotify: 'Spotify', deezer: 'Deezer', amazon: 'Amazon Music' };
   const name = names[platform] || 'servico';
   const action =
     role === 'src'
@@ -2953,6 +3025,86 @@ async function saveSpotifyOAuthSetup() {
   }
 }
 
+function getAmazonRedirectUri() {
+  return state.platforms.amazon?.oauth_redirect_uri || `${getSpotifySetupOrigin()}/auth/amazon/callback`;
+}
+
+async function copyAmazonRedirectUri(role) {
+  const redirectUri = document.getElementById(`${role}-amazon-redirect-uri`)?.value || getAmazonRedirectUri();
+  try {
+    await navigator.clipboard.writeText(redirectUri);
+    showToast('Return URL da Amazon copiada.', 'success');
+  } catch {
+    showToast('Nao consegui copiar automaticamente. Selecione e copie o texto.', 'warn');
+  }
+}
+
+async function saveAmazonOfficialSetup(role) {
+  const status = document.getElementById(`${role}-amazon-status`);
+  const saveBtn = document.querySelector(`#${role}-amazon-details .btn-primary`);
+  const apiKey = document.getElementById(`${role}-amazon-api-key`)?.value?.trim() || '';
+  const clientId = document.getElementById(`${role}-amazon-client-id`)?.value?.trim() || '';
+  const clientSecret = document.getElementById(`${role}-amazon-client-secret`)?.value?.trim() || '';
+  const countryCode = document.getElementById(`${role}-amazon-country-code`)?.value?.trim() || 'US';
+  const scopes = document.getElementById(`${role}-amazon-scopes`)?.value?.trim() || 'profile music::catalog music::library';
+
+  if (!apiKey || !clientId) {
+    if (status) {
+      status.textContent = 'Cole o Security Profile ID e o Client ID do Login With Amazon antes de salvar.';
+    }
+    return;
+  }
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<span class="spin-inline"></span> Salvando...';
+  }
+  if (status) {
+    status.textContent = 'Salvando configuracao oficial da Amazon...';
+  }
+
+  try {
+    const r = await fetch('/api/config/amazon-music', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        api_key: apiKey,
+        client_id: clientId,
+        client_secret: clientSecret,
+        country_code: countryCode,
+        scopes,
+        base_url: getSpotifySetupOrigin(),
+      }),
+    });
+    const d = await r.json();
+    if (!d.ok) {
+      throw new Error(d.error || 'Nao foi possivel salvar a configuracao da Amazon Music.');
+    }
+
+    state.platforms.amazon = {
+      ...(state.platforms.amazon || {}),
+      oauth_configured: true,
+      auto_configured: true,
+      api_key_configured: true,
+      country_code: d.country_code || countryCode,
+      scopes: d.scopes || scopes,
+      oauth_redirect_uri: d.oauth_redirect_uri || getAmazonRedirectUri(),
+    };
+    showToast('Amazon Music oficial configurado. Abrindo login agora.', 'success');
+    renderConnectForms();
+    setTimeout(() => openOAuthPopup('amazon', role), 250);
+  } catch (error) {
+    const message = humanizePlatformError(error?.message || 'Nao foi possivel salvar a configuracao da Amazon Music.');
+    if (status) status.textContent = message;
+    showToast(message, 'error');
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Salvar e conectar';
+    }
+  }
+}
+
 function humanizePlatformError(message) {
   const raw = String(message || '').trim();
   if (!raw) {
@@ -2963,7 +3115,7 @@ function humanizePlatformError(message) {
 
   if (lowered.includes('playlist pode ter mais de 50')) {
     if (state.platforms.spotify?.oauth_configured) {
-      return 'Essa playlist do Spotify e grande. Clique em "Entrar e autorizar" para liberar a leitura completa.';
+      return 'Essa playlist do Spotify e grande. Clique em "Fazer login e autorizar" para liberar a leitura completa.';
     }
     return 'Essa playlist do Spotify e maior do que o acesso publico permite nesta instalacao.';
   }
@@ -2973,7 +3125,7 @@ function humanizePlatformError(message) {
     lowered.includes('nao esta publica') ||
     lowered.includes('acesso compartilhado ou protegido')
   ) {
-    return 'Essa playlist do Spotify nao esta publica. Sem entrar no Spotify, o app nao consegue abrir ela.';
+    return 'Essa playlist do Spotify nao esta publica. Sem fazer login no Spotify, o app nao consegue abrir ela.';
   }
 
   if (
@@ -2983,7 +3135,7 @@ function humanizePlatformError(message) {
     lowered.includes('cookie informado')
   ) {
     if (state.platforms.spotify?.oauth_configured) {
-      return 'O modo manual do Spotify nao conseguiu confirmar sua sessao. Use o login oficial em "Entrar e autorizar".';
+      return 'O modo manual do Spotify nao conseguiu confirmar sua sessao. Use o login oficial em "Fazer login e autorizar".';
     }
     return 'O modo manual do Spotify nao conseguiu confirmar sua sessao. Para evitar isso de vez, esta instalacao ainda precisa ativar o login oficial do Spotify.';
   }
@@ -3122,12 +3274,33 @@ function humanizePlatformError(message) {
     return 'Para usar a Apple Music aqui, faltam os codigos dessa conta.';
   }
 
-  if (lowered.includes('api key do amazon music') || lowered.includes('access token do amazon music')) {
-    return 'Para usar Amazon Music aqui, faltam os dados liberados da API dessa conta.';
+  if (
+    lowered.includes('amazon_music_api_access_required') ||
+    lowered.includes('amazon_music_oauth_required') ||
+    lowered.includes('api key do amazon music') ||
+    lowered.includes('access token do amazon music')
+  ) {
+    return 'Amazon Music ainda nao esta disponivel nesta instalacao.';
+  }
+
+  if (lowered.includes('amazon_music_api_not_enabled')) {
+    return 'A Amazon abriu a conta, mas ainda nao liberou esta integracao para criar playlists aqui.';
+  }
+
+  if (lowered.includes('amazon_lwa_token_exchange_failed')) {
+    return 'A Amazon abriu o login, mas nao concluiu a autorizacao para o PlayTransfer. Tente novamente.';
+  }
+
+  if (lowered.includes('amazon_music_auth_failed')) {
+    return 'A Amazon Music recusou essa sessao. Tente conectar novamente.';
+  }
+
+  if (lowered.includes('amazon_music_validation_failed')) {
+    return 'Consegui voltar da Amazon, mas ainda nao consegui confirmar a permissao para criar playlists aqui.';
   }
 
   if (lowered.includes('beta fechado') && lowered.includes('amazon music')) {
-    return 'A Amazon Music ainda nao liberou esse acesso para esta conta ou aplicativo.';
+    return 'Amazon Music ainda nao esta disponivel nesta instalacao.';
   }
 
   if (lowered.includes('login do google foi cancelado')) {
@@ -3404,6 +3577,7 @@ function resetSpotifyAutoBtn(role) {
 }
 
 let appleMusicKitLoaderPromise = null;
+const APPLE_MUSIC_LOGIN_WINDOW_NAME = 'apple-music-service-view';
 
 async function fetchAppleMusicConfig() {
   const response = await fetch('/api/config/apple-music');
@@ -3456,28 +3630,231 @@ function setAppleAutoButton(role, busy) {
   btn.innerHTML = busy ? '<span class="spin-inline"></span> Conectando...' : '🔌 Tentar novamente';
 }
 
+function appleLoginPopupFeatures() {
+  const width = 520;
+  const height = 720;
+  const left = Math.max(0, Math.round((window.screenX || 0) + ((window.outerWidth || window.innerWidth || 1200) - width) / 2));
+  const top = Math.max(0, Math.round((window.screenY || 0) + ((window.outerHeight || window.innerHeight || 900) - height) / 2));
+  return `popup=yes,width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=yes`;
+}
+
+function openAppleLoginPopupShell() {
+  try {
+    const popup = window.open('', APPLE_MUSIC_LOGIN_WINDOW_NAME, appleLoginPopupFeatures());
+    if (popup && !popup.closed) {
+      try {
+        popup.document.title = 'Login Apple Music - PlayTransfer';
+        popup.document.body.style.cssText = 'margin:0;display:grid;place-items:center;min-height:100vh;background:#111;color:#fff;font-family:sans-serif;';
+        popup.document.body.innerHTML = '<div style="text-align:center;max-width:320px;padding:24px;"><strong>Apple Music</strong><p>Preparando login oficial...</p></div>';
+      } catch {}
+      popup.focus();
+    }
+    return popup || null;
+  } catch {
+    return null;
+  }
+}
+
+function closeAppleLoginPopup(popup) {
+  try {
+    if (popup && !popup.closed) popup.close();
+  } catch {}
+}
+
+function looksLikeAppleMusicUserToken(value) {
+  const token = String(value || '').trim().replace(/^Bearer\s+/i, '');
+  if (!token || token.length < 40) return false;
+  if (/[\s{}()[\]"']/.test(token)) return false;
+  if (/cachedsource|clientconfig|feature|experiment|config/i.test(token)) return false;
+  return true;
+}
+
+function readAppleMusicTokenFromStorage() {
+  const stores = [window.localStorage, window.sessionStorage].filter(Boolean);
+  const tokenPattern = /(?:media-user-token|music-user-token|musicUserToken|userToken)["']?\s*[:=]\s*["']?([A-Za-z0-9._=-]{40,})/i;
+
+  for (const store of stores) {
+    try {
+      for (let i = 0; i < store.length; i++) {
+        const key = String(store.key(i) || '');
+        const value = String(store.getItem(key) || '');
+        const combined = `${key}=${value}`;
+        const match = combined.match(tokenPattern);
+        if (match && looksLikeAppleMusicUserToken(match[1])) return match[1].trim();
+
+        const lowerKey = key.toLowerCase();
+        if (
+          (lowerKey.includes('media-user-token') ||
+            lowerKey.includes('music-user-token') ||
+            lowerKey.includes('musicusertoken') ||
+            lowerKey.includes('usertoken')) &&
+          looksLikeAppleMusicUserToken(value)
+        ) {
+          return value.trim();
+        }
+      }
+    } catch {}
+  }
+  return '';
+}
+
+function getAppleMusicUserToken(music, event = null) {
+  const candidates = [
+    music?.musicUserToken,
+    event?.musicUserToken,
+    event?.userToken,
+    event?.token,
+    event?.data?.musicUserToken,
+    event?.data?.userToken,
+    event?.detail?.musicUserToken,
+    event?.detail?.userToken,
+    readAppleMusicTokenFromStorage(),
+  ];
+
+  for (const candidate of candidates) {
+    const token = String(candidate || '').trim();
+    if (looksLikeAppleMusicUserToken(token)) return token.replace(/^Bearer\s+/i, '');
+  }
+  return '';
+}
+
+function waitForAppleMusicAuthorization(music, authorizeAction, loginPopup) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const listeners = [];
+    const startedAt = Date.now();
+
+    const cleanup = () => {
+      clearInterval(interval);
+      clearTimeout(timeout);
+      for (const [target, eventName, handler] of listeners) {
+        try {
+          target?.removeEventListener?.(eventName, handler);
+        } catch {}
+      }
+    };
+
+    const finish = (token) => {
+      if (settled) return;
+      const normalized = String(token || '').trim();
+      if (!looksLikeAppleMusicUserToken(normalized)) return;
+      settled = true;
+      cleanup();
+      closeAppleLoginPopup(loginPopup);
+      resolve(normalized.replace(/^Bearer\s+/i, ''));
+    };
+
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      closeAppleLoginPopup(loginPopup);
+      reject(error instanceof Error ? error : new Error(String(error || 'apple_musickit_authorize_failed')));
+    };
+
+    const check = (event = null) => {
+      const token = getAppleMusicUserToken(music, event);
+      if (token) finish(token);
+    };
+
+    const eventNames = [
+      window.MusicKit?.Events?.userTokenDidChange,
+      window.MusicKit?.Events?.authorizationStatusDidChange,
+      'userTokenDidChange',
+      'authorizationStatusDidChange',
+    ].filter(Boolean);
+
+    for (const target of [music, music?.storekit].filter(Boolean)) {
+      for (const eventName of eventNames) {
+        try {
+          const handler = (event) => check(event);
+          target?.addEventListener?.(eventName, handler);
+          listeners.push([target, eventName, handler]);
+        } catch {}
+      }
+    }
+
+    const interval = setInterval(() => {
+      check();
+      try {
+        if (loginPopup && loginPopup.closed && Date.now() - startedAt > 2500) {
+          const token = getAppleMusicUserToken(music);
+          if (token) finish(token);
+          else fail(new Error('apple_musickit_authorize_closed'));
+        }
+      } catch {}
+    }, 500);
+
+    const timeout = setTimeout(() => {
+      const token = getAppleMusicUserToken(music);
+      if (token) finish(token);
+      else fail(new Error('apple_musickit_authorize_timeout'));
+    }, 90000);
+
+    check();
+
+    let authorizePromise;
+    try {
+      authorizePromise = typeof authorizeAction === 'function' ? authorizeAction() : authorizeAction;
+    } catch (error) {
+      fail(error);
+      return;
+    }
+
+    Promise.resolve(authorizePromise)
+      .then((token) => {
+        const resolvedToken = token || getAppleMusicUserToken(music);
+        if (resolvedToken) {
+          finish(resolvedToken);
+          return;
+        }
+        setTimeout(() => {
+          const lateToken = getAppleMusicUserToken(music);
+          if (lateToken) finish(lateToken);
+          else fail(new Error('apple_music_user_token_required'));
+        }, 1200);
+      })
+      .catch((error) => fail(error));
+  });
+}
+
 async function ensureAppleMusicKitLoaded() {
   if (window.MusicKit) return window.MusicKit;
   if (appleMusicKitLoaderPromise) return appleMusicKitLoaderPromise;
 
   appleMusicKitLoaderPromise = new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      if (!window.MusicKit) return;
+      settled = true;
+      resolve(window.MusicKit);
+    };
+    const fail = () => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('apple_musickit_load_failed'));
+    };
+
+    document.addEventListener('musickitloaded', finish, { once: true });
+
     const existing = document.querySelector('script[data-musickit-loader="apple"]');
     if (existing) {
-      existing.addEventListener('load', () => resolve(window.MusicKit));
-      existing.addEventListener('error', () => reject(new Error('apple_musickit_load_failed')));
+      existing.addEventListener('load', finish, { once: true });
+      existing.addEventListener('error', fail, { once: true });
+      setTimeout(finish, 0);
+      setTimeout(fail, 15000);
       return;
     }
 
     const script = document.createElement('script');
-    script.src = 'https://js-cdn.music.apple.com/musickit/v3/musickit.js';
+    script.src = 'https://js-cdn.music.apple.com/musickit/v1/musickit.js';
     script.async = true;
     script.dataset.musickitLoader = 'apple';
-    script.onload = () => {
-      if (window.MusicKit) resolve(window.MusicKit);
-      else reject(new Error('apple_musickit_load_failed'));
-    };
-    script.onerror = () => reject(new Error('apple_musickit_load_failed'));
+    script.onload = finish;
+    script.onerror = fail;
     document.head.appendChild(script);
+    setTimeout(fail, 15000);
   });
 
   return appleMusicKitLoaderPromise;
@@ -3496,7 +3873,7 @@ async function getAppleMusicInstance(developerToken) {
         developerToken,
         app: {
           name: 'PlayTransfer',
-          build: '1.2.3',
+          build: '1.2.19',
         },
       });
       state.appleMusicKitConfig = { developerToken };
@@ -3514,19 +3891,45 @@ async function getAppleMusicInstance(developerToken) {
   return instance;
 }
 
-async function authorizeAppleMusicUser(developerToken) {
-  const music = await getAppleMusicInstance(developerToken);
+async function authorizeAppleMusicUser(developerToken, loginPopup = null) {
+  let music;
+  try {
+    music = await getAppleMusicInstance(developerToken);
+  } catch (error) {
+    closeAppleLoginPopup(loginPopup);
+    throw error;
+  }
 
   if (music.musicUserToken) {
+    closeAppleLoginPopup(loginPopup);
     return music.musicUserToken;
   }
 
+  const originalOpen = window.open;
+  window.open = function(url, target, features) {
+    const text = String(url || '');
+    if (/apple\.com|idmsa\.apple\.com|itunes\.apple\.com/i.test(text)) {
+      if (loginPopup && !loginPopup.closed) {
+        try {
+          loginPopup.location.href = text;
+          loginPopup.focus();
+          return loginPopup;
+        } catch {}
+      }
+      return originalOpen.call(window, text, target || APPLE_MUSIC_LOGIN_WINDOW_NAME, appleLoginPopupFeatures());
+    }
+    return originalOpen.apply(window, arguments);
+  };
+
   try {
-    const token = await music.authorize();
-    return token || music.musicUserToken || '';
+    const token = await waitForAppleMusicAuthorization(music, () => music.authorize(), loginPopup);
+    return token || '';
   } catch (error) {
+    closeAppleLoginPopup(loginPopup);
     const reason = String(error?.message || error || '').trim();
     throw new Error(`apple_musickit_authorize_failed${reason ? `:${reason}` : ''}`);
+  } finally {
+    window.open = originalOpen;
   }
 }
 
@@ -3556,7 +3959,7 @@ function makeAppleForm(role) {
     ? 'Se a playlist for publica, o app ja consegue ler so pelo link. Se o MusicKit desta instalacao estiver pronto, este botao tambem entra na conta Apple Music.'
     : 'Quando esta instalacao ja tem o developer token salvo, este botao abre o login oficial da Apple e conecta a conta em um passo.';
   const automaticHint = role === 'src'
-    ? 'Para usar apenas links publicos, voce pode seguir sem login. Para entrar na conta Apple Music, falta so o setup do MusicKit desta instalacao.'
+    ? 'Para usar apenas links publicos, voce pode seguir sem login. Para fazer login na conta Apple Music, falta so o setup do MusicKit desta instalacao.'
     : 'Se ainda nao houver MusicKit configurado, o app abre o bloco abaixo para salvar o developer token e continuar daqui.';
 
   wrapper.appendChild(makeAutomaticConnectPanel({
@@ -3613,7 +4016,7 @@ async function connectApple(role, options = {}) {
     }
 
     if (!musicUserToken) {
-      musicUserToken = await authorizeAppleMusicUser(developerToken);
+      musicUserToken = await authorizeAppleMusicUser(developerToken, options.loginPopup || null);
     }
 
     if (!musicUserToken) {
@@ -3658,6 +4061,7 @@ async function connectApple(role, options = {}) {
 async function autoConnectApple(role) {
   const status = document.getElementById(`${role}-apple-status`);
   setAppleAutoButton(role, true);
+  let loginPopup = null;
 
   try {
     let config = await fetchAppleMusicConfig().catch(() => null);
@@ -3724,7 +4128,7 @@ humanizePlatformError = function(message) {
   }
 
   if (lowered.includes('apple_musickit_authorize_failed')) {
-    return 'A Apple Music nao concluiu a autorizacao da conta. Entre na janela oficial e tente novamente.';
+    return 'A Apple Music nao concluiu a autorizacao da conta. Tente o login oficial novamente.';
   }
 
   return _previousHumanizePlatformError(raw);
@@ -3743,7 +4147,7 @@ function makeAppleForm(role) {
     role,
     title: 'Conectar Apple Music',
     subtitle: role === 'src'
-      ? 'Para playlists publicas, o app pode ler so pelo link. Se voce quiser entrar na conta Apple Music, este botao abre o login oficial em um clique.'
+      ? 'Para playlists publicas, o app pode ler so pelo link. Se voce quiser fazer login na conta Apple Music, este botao abre o login oficial em um clique.'
       : 'Este botao abre o login oficial da Apple Music e conecta a conta aqui mesmo, no mesmo fluxo dos outros destinos.',
     hint: installationReady
       ? 'O usuario final nao precisa preencher token, pais da conta ou codigo manual.'
@@ -3759,6 +4163,7 @@ function makeAppleForm(role) {
 async function autoConnectApple(role) {
   const status = document.getElementById(`${role}-apple-status`);
   setAppleAutoButton(role, true);
+  let loginPopup = null;
 
   try {
     const config = await fetchAppleMusicConfig().catch(() => null);
@@ -3810,6 +4215,135 @@ function resetAppleGuidedPoll(role) {
   }
 }
 
+function isAppleCloudLibraryError(message) {
+  const lowered = String(message || '').toLowerCase();
+  return (
+    lowered.includes('apple_music_cloud_library_required') ||
+    lowered.includes('apple_music_subscription_or_library_required') ||
+    lowered.includes('apple_music_user_token_required_after_login') ||
+    lowered.includes('cloudlibrary')
+  );
+}
+
+function isAppleAuthorizationFinishedWithoutLibrary(message) {
+  const lowered = String(message || '').toLowerCase();
+  return (
+    lowered.includes('apple_musickit_authorize_failed') ||
+    lowered.includes('apple_music_user_token_required') ||
+    lowered.includes('apple_musickit_authorize_closed') ||
+    lowered.includes('apple_musickit_authorize_timeout')
+  );
+}
+
+function normalizeAppleStorefront(value) {
+  const storefront = String(value || '').trim().toLowerCase();
+  return /^[a-z]{2}$/.test(storefront) ? storefront : '';
+}
+
+function appleCloudLibraryUnlockUrl(role) {
+  const cached = state.appleMusicLastAuth?.[role] || {};
+  const formStorefront = document.getElementById(`${role}-apple-storefront`)?.value;
+  const browserCountry = String(navigator.language || '').split('-')[1] || '';
+  const storefront =
+    normalizeAppleStorefront(formStorefront) ||
+    normalizeAppleStorefront(cached.storefront) ||
+    normalizeAppleStorefront(browserCountry) ||
+    'br';
+  return `https://music.apple.com/${storefront}/subscribe`;
+}
+
+function renderAppleCloudLibraryUnlock(role, rawMessage = '') {
+  const status = document.getElementById(`${role}-apple-status`);
+  if (!status) return;
+
+  const message = humanizePlatformError(rawMessage || 'apple_music_cloud_library_required');
+  status.innerHTML = `
+    <div class="apple-library-unlock">
+      <div class="apple-library-unlock-title">Conta Apple Music encontrada</div>
+      <div class="apple-library-unlock-copy">${message}</div>
+      <div class="manual-connect-actions">
+        <button class="btn btn-primary btn-sm" type="button" onclick="openAppleCloudLibraryUnlock('${role}')">
+          Abrir Apple Music na web
+        </button>
+        <button class="btn btn-secondary btn-sm" type="button" onclick="retryAppleCloudLibrary('${role}')">
+          Tentar novamente
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+function openAppleCloudLibraryUnlock(role) {
+  const url = appleCloudLibraryUnlockUrl(role);
+  const opened = window.open(url, '_blank');
+  try {
+    if (opened) opened.opener = null;
+  } catch {}
+  const status = document.getElementById(`${role}-apple-status`);
+
+  if (!opened) {
+    if (status) {
+      status.innerHTML = `
+        <div class="apple-library-unlock">
+          <div class="apple-library-unlock-title">Abra a ativacao da Apple</div>
+          <div class="apple-library-unlock-copy">
+             O navegador bloqueou a nova aba. Abra este link web e depois volte para tentar novamente:
+             <a href="${url}" target="_blank" rel="noopener">ativacao online do Apple Music</a>
+          </div>
+          <div class="manual-connect-actions">
+            <button class="btn btn-secondary btn-sm" type="button" onclick="retryAppleCloudLibrary('${role}')">
+              Tentar novamente
+            </button>
+          </div>
+        </div>
+      `;
+    }
+    showToast('O navegador bloqueou a aba da Apple. Use o link exibido no card.', 'warn');
+    return;
+  }
+
+  if (status) {
+    status.innerHTML = `
+      <div class="apple-library-unlock">
+        <div class="apple-library-unlock-title">Finalize no site da Apple</div>
+        <div class="apple-library-unlock-copy">
+          Depois que a Apple liberar a assinatura ou a biblioteca dessa conta no Apple Music Web, volte aqui e tente novamente.
+        </div>
+        <div class="manual-connect-actions">
+          <button class="btn btn-secondary btn-sm" type="button" onclick="retryAppleCloudLibrary('${role}')">
+            Tentar novamente
+          </button>
+        </div>
+      </div>
+    `;
+  }
+}
+
+async function retryAppleCloudLibrary(role) {
+  const status = document.getElementById(`${role}-apple-status`);
+  if (status) status.innerHTML = '<span class="spin-inline"></span> Verificando a liberacao da Apple Music...';
+
+  try {
+    const cached = state.appleMusicLastAuth?.[role];
+    if (cached?.music_user_token || cached?.cookie_header) {
+      await connectApple(role, {
+        developer_token: cached.developer_token || '',
+        music_user_token: cached.music_user_token || '',
+        storefront: cached.storefront || 'us',
+        cookie_header: cached.cookie_header || '',
+        itfe: cached.itfe || '',
+      });
+      return;
+    }
+
+    await autoConnectApple(role);
+  } catch (error) {
+    const message = humanizePlatformError(error?.message || 'Falha ao verificar a Apple Music');
+    if (status) status.textContent = message;
+    showToast(message, 'error');
+  }
+}
+
 async function connectApple(role, options = {}) {
   const status = document.getElementById(`${role}-apple-status`);
   let musicUserToken = options.music_user_token ?? '';
@@ -3824,7 +4358,7 @@ async function connectApple(role, options = {}) {
     const developerToken = options.developer_token || config?.developer_token || '';
     storefront = (options.storefront || config?.storefront || storefront || 'us').toLowerCase();
 
-    if (!musicUserToken && role === 'src') {
+    if (!musicUserToken && !cookieHeader && role === 'src') {
       const response = await fetch('/api/connect/apple', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -3844,9 +4378,24 @@ async function connectApple(role, options = {}) {
       throw new Error('apple_musickit_not_configured');
     }
 
-    if (!musicUserToken) {
-      throw new Error('apple_music_user_token_required');
+    if (!musicUserToken && !cookieHeader) {
+      if (status) status.innerHTML = '<span class="spin-inline"></span> Abrindo login oficial da Apple Music...';
+      musicUserToken = await authorizeAppleMusicUser(developerToken, options.loginPopup || null);
+      if (status) status.innerHTML = '<span class="spin-inline"></span> Login autorizado. Validando biblioteca...';
     }
+
+    if (!musicUserToken && !cookieHeader) {
+      throw new Error('apple_music_user_token_required_after_login');
+    }
+
+    state.appleMusicLastAuth = state.appleMusicLastAuth || {};
+    state.appleMusicLastAuth[role] = {
+      developer_token: developerToken,
+      music_user_token: musicUserToken,
+      storefront,
+      cookie_header: cookieHeader,
+      itfe,
+    };
 
     const response = await fetch('/api/connect/apple', {
       method: 'POST',
@@ -3878,6 +4427,12 @@ async function connectApple(role, options = {}) {
     checkTransferReady();
     return true;
   } catch (error) {
+    if (isAppleCloudLibraryError(error?.message) || isAppleAuthorizationFinishedWithoutLibrary(error?.message)) {
+      renderAppleCloudLibraryUnlock(role, isAppleCloudLibraryError(error?.message) ? error?.message : 'apple_music_subscription_or_library_required');
+      showToast(humanizePlatformError('apple_music_subscription_or_library_required'), 'warn');
+      return false;
+    }
+
     const message = humanizePlatformError(error?.message || 'Falha ao conectar Apple Music');
     if (status) status.textContent = message;
     showToast(message, 'error');
@@ -3892,7 +4447,7 @@ async function pollAppleGuidedConnect(role, attempt = 0) {
     const response = await fetch(`/api/connect/apple/browser-guided/status?role=${encodeURIComponent(role)}`);
     const data = await response.json();
 
-    if (data.status === 'captured' && data.music_user_token) {
+    if (data.status === 'captured' && (data.music_user_token || data.cookie_header)) {
       if (status) status.innerHTML = '<span class="spin-inline"></span> Login reconhecido. Confirmando conexao...';
       await connectApple(role, {
         music_user_token: data.music_user_token,
@@ -3906,6 +4461,14 @@ async function pollAppleGuidedConnect(role, attempt = 0) {
     }
 
     if (data.status === 'error') {
+      if (isAppleCloudLibraryError(data.error)) {
+        renderAppleCloudLibraryUnlock(role, data.error);
+        showToast(humanizePlatformError(data.error), 'warn');
+        setAppleAutoButton(role, false);
+        resetAppleGuidedPoll(role);
+        return;
+      }
+
       const message = humanizePlatformError(data.error || 'Falha ao confirmar o login da Apple Music');
       if (status) status.textContent = message;
       showToast(message, 'error');
@@ -3915,7 +4478,7 @@ async function pollAppleGuidedConnect(role, attempt = 0) {
     }
 
     if (status && attempt === 0) {
-      status.innerHTML = '<span class="spin-inline"></span> Aguardando o login na janela "Login Apple Music - PlayTransfer"...';
+      status.innerHTML = '<span class="spin-inline"></span> Aguardando o login no Apple Music Web...';
     }
   } catch {
     if (status) status.textContent = 'Erro de rede enquanto eu aguardava a Apple Music.';
@@ -3933,25 +4496,25 @@ async function pollAppleGuidedConnect(role, attempt = 0) {
 
 async function startAppleGuidedConnect(role) {
   const status = document.getElementById(`${role}-apple-status`);
-  if (status) status.innerHTML = '<span class="spin-inline"></span> Abrindo uma janela guiada da Apple Music...';
-
-  const response = await fetch('/api/connect/apple/browser-guided/start', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ role }),
-  });
-  const data = await response.json();
-  if (!data.ok) {
-    throw new Error(data.error || 'Falha ao abrir a Apple Music');
-  }
-
+  if (status) status.innerHTML = '<span class="spin-inline"></span> Abrindo login oficial da Apple Music...';
   resetAppleGuidedPoll(role);
-  pollAppleGuidedConnect(role, 0);
+  const loginPopup = openAppleLoginPopupShell();
+  const config = await fetchAppleMusicConfig().catch(() => null);
+  if (!config?.configured || !config?.developer_token) {
+    closeAppleLoginPopup(loginPopup);
+    throw new Error('apple_musickit_not_configured');
+  }
+  return connectApple(role, {
+    developer_token: config.developer_token,
+    storefront: config.storefront || 'us',
+    loginPopup,
+  });
 }
 
 async function autoConnectApple(role) {
   const status = document.getElementById(`${role}-apple-status`);
   setAppleAutoButton(role, true);
+  let loginPopup = null;
 
   try {
     if (role === 'src') {
@@ -3963,9 +4526,30 @@ async function autoConnectApple(role) {
       }
     }
 
-    await startAppleGuidedConnect(role);
-    return true;
+    loginPopup = openAppleLoginPopupShell();
+    const config = await fetchAppleMusicConfig().catch(() => null);
+    if (!config?.configured || !config?.developer_token) {
+      closeAppleLoginPopup(loginPopup);
+      throw new Error('apple_musickit_not_configured');
+    }
+
+    const success = await connectApple(role, {
+      developer_token: config?.developer_token || '',
+      storefront: config?.storefront || 'us',
+      loginPopup,
+    });
+    setAppleAutoButton(role, false);
+    return success;
   } catch (error) {
+    closeAppleLoginPopup(loginPopup);
+    if (isAppleCloudLibraryError(error?.message) || isAppleAuthorizationFinishedWithoutLibrary(error?.message)) {
+      renderAppleCloudLibraryUnlock(role, isAppleCloudLibraryError(error?.message) ? error?.message : 'apple_music_subscription_or_library_required');
+      showToast(humanizePlatformError('apple_music_subscription_or_library_required'), 'warn');
+      setAppleAutoButton(role, false);
+      resetAppleGuidedPoll(role);
+      return false;
+    }
+
     const message = humanizePlatformError(error?.message || 'Falha ao iniciar a Apple Music');
     if (status) status.textContent = message;
     showToast(message, 'error');
@@ -3981,7 +4565,7 @@ humanizePlatformError = function(message) {
   const lowered = raw.toLowerCase();
 
   if (lowered.includes('missing_apple_user_token')) {
-    return 'Nao consegui confirmar o login da Apple Music nessa tentativa. Entre na janela que abriu e tente novamente.';
+    return 'Nao consegui confirmar o login da Apple Music nessa tentativa. Tente o login oficial novamente.';
   }
 
   if (lowered.includes('apple_musickit_config_failed')) {
@@ -3989,15 +4573,47 @@ humanizePlatformError = function(message) {
   }
 
   if (lowered.includes('apple_musickit_load_failed')) {
-    return 'Nao consegui abrir o login guiado da Apple Music agora.';
+    return 'Nao consegui carregar o login oficial da Apple Music agora.';
   }
 
-  if (lowered.includes('apple music rejeitou os tokens')) {
-    return 'Consegui abrir a conta Apple Music, mas a validacao da sessao falhou. Tente novamente na janela oficial.';
+  if (lowered.includes('apple_musickit_authorize_timeout')) {
+    return 'A janela da Apple Music ficou aberta, mas a autorizacao nao voltou para o app. Feche a janela e tente conectar novamente.';
+  }
+
+  if (lowered.includes('apple_musickit_authorize_closed')) {
+    return 'A janela da Apple Music foi fechada antes da autorizacao voltar para o app. Tente conectar novamente.';
+  }
+
+  if (lowered.includes('apple_browser_session_not_found') || lowered.includes('nao encontrei a sessao da apple music')) {
+    return 'Nao encontrei o login da Apple Music no navegador ainda. Faca login no Apple Music Web e tente novamente.';
+  }
+
+  if (lowered.includes('chrome desta maquina bloqueou') && lowered.includes('apple')) {
+    return 'Esse caminho antigo tentava ler a sessao do Chrome. Atualize a pagina e tente novamente: agora o login da Apple Music usa uma janela oficial do MusicKit.';
+  }
+
+  if (lowered.includes('apple_music_cloud_library_required') || lowered.includes('cloudlibrary')) {
+    return 'Consegui abrir a conta Apple Music, mas essa conta nao liberou acesso a biblioteca do iCloud Music. Sem isso, a Apple nao deixa criar playlists aqui.';
+  }
+
+  if (
+    lowered.includes('apple_music_subscription_or_library_required') ||
+    lowered.includes('apple_music_user_token_required_after_login') ||
+    lowered.includes('apple_music_user_token_required')
+  ) {
+    return 'Consegui abrir a conta Apple Music, mas a Apple nao liberou acesso a biblioteca do iCloud Music. Se voce clicou em "Agora nao", conclua essa liberacao na Apple e tente novamente.';
+  }
+
+  if (lowered.includes('apple_musickit_authorize_failed')) {
+    return 'Consegui abrir a Apple Music, mas a autorizacao nao liberou a biblioteca do iCloud Music para criar playlists aqui. Conclua essa liberacao na Apple e tente novamente.';
+  }
+
+  if (lowered.includes('apple music rejeitou a sessao') || lowered.includes('apple music rejeitou os tokens')) {
+    return 'Consegui abrir a conta Apple Music, mas a validacao da sessao falhou. Tente o login oficial novamente.';
   }
 
   if (lowered.includes('apple_music_validation_failed')) {
-    return 'Consegui abrir a Apple Music, mas ainda nao apareceu uma sessao valida dessa conta. Entre totalmente na conta na janela e tente outra vez.';
+    return 'Consegui abrir a Apple Music, mas a sessao dessa conta ainda nao ficou valida para o app. Faca o login oficial completo e tente outra vez.';
   }
 
   return ___previousHumanizePlatformError(raw);

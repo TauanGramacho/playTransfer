@@ -13,6 +13,7 @@ import socket
 import subprocess
 import tempfile
 import time
+import unicodedata
 import urllib.parse
 import urllib.error
 import urllib.request
@@ -592,12 +593,63 @@ def read_playlist(url: str) -> tuple[str, list[dict]]:
     return nome, faixas
 
 
+def _ascii_search_variant(value: str) -> str:
+    text = _as_text(value)
+    if not text:
+        return ""
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").strip()
+
+
+def _strip_title_noise(value: str) -> str:
+    text = _as_text(value)
+    if not text:
+        return ""
+    text = re.sub(
+        r"\s*[\[(][^\])]*(?:feat\.?|featuring|with|remaster(?:ed)?|remix|explicit|clean|version|mono|stereo|deluxe|live)[^\])]*[\])]",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _youtube_search_queries(titulo: str, artista: str) -> list[str]:
+    title = _as_text(titulo)
+    artist = _as_text(artista)
+    clean_title = _strip_title_noise(title)
+    ascii_title = _ascii_search_variant(title)
+    ascii_artist = _ascii_search_variant(artist)
+    first_artist = re.split(r"\s*(?:,|&|\bfeat\.?\b|\bfeaturing\b)\s*", artist, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+    candidates = [
+        f"{artist} {title}" if artist else title,
+        f"{ascii_artist} {ascii_title}" if ascii_artist and ascii_title else "",
+        f"{first_artist} {title}" if first_artist and first_artist != artist else "",
+        f"{artist} {clean_title}" if artist and clean_title and clean_title != title else "",
+        f"{first_artist} {clean_title}" if first_artist and clean_title and clean_title != title else "",
+        title,
+        clean_title if clean_title != title else "",
+    ]
+
+    queries = []
+    seen = set()
+    for query in candidates:
+        normalized = re.sub(r"\s+", " ", _as_text(query))
+        key = normalized.casefold()
+        if normalized and key not in seen:
+            seen.add(key)
+            queries.append(normalized)
+    return queries
+
+
 def search_track(ytm: "YTMusic", titulo: str, artista: str) -> str | None:
     try:
-        query = f"{artista} {titulo}" if artista else titulo
-        results = ytm.search(query, filter="songs", limit=1)
-        if results:
-            return results[0].get("videoId")
+        for query in _youtube_search_queries(titulo, artista):
+            results = ytm.search(query, filter="songs", limit=5)
+            for result in results or []:
+                video_id = result.get("videoId")
+                if video_id:
+                    return video_id
     except Exception:
         pass
     return None

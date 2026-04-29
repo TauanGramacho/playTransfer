@@ -10,7 +10,7 @@ import webview
 
 
 WINDOW_TITLE = "Login Apple Music - PlayTransfer"
-APPLE_MUSIC_URL = "https://music.apple.com/us/browse"
+APPLE_MUSIC_URL = "https://music.apple.com/br/new"
 DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".runtime", "apple_webview_debug.log")
 CHROME_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -53,15 +53,25 @@ APPLE_CAPTURE_JS = r"""
     return true;
   }
 
+  function rememberAuthorized(value, source) {
+    var text = String(value || '').trim();
+    var numeric = Number(text);
+    if (!(value === true || numeric >= 3 || text.toUpperCase() === 'AUTHORIZED')) return false;
+    window.__ptAppleAuthorized = true;
+    window.__ptAppleAuthorizedSource = source || 'apple-web';
+    return true;
+  }
+
   function considerUrl(value, source) {
     var text = String(value || '');
     if (!text) return false;
     var match = text.match(/music\.apple\.com\/([a-z]{2})(?:\/|$)/i) || text.match(/\/v1\/catalog\/([a-z]{2})(?:\/|$)/i);
     if (match) {
       rememberStorefront(match[1], source);
-      return true;
     }
-    return false;
+    var itfeMatch = text.match(/[?&]itfe=([A-Za-z0-9._:-]{8,})/i);
+    if (itfeMatch) rememberItfe(itfeMatch[1], source);
+    return !!match || !!itfeMatch;
   }
 
   function considerText(value, source) {
@@ -74,7 +84,7 @@ APPLE_CAPTURE_JS = r"""
     if (itfeMatch) rememberItfe(itfeMatch[1], source);
 
     var tokenPatterns = [
-      /["']?(?:media-user-token|music-user-token|musicUserToken)["']?\s*[:=]\s*["']?([A-Za-z0-9._=-]{40,})/i,
+      /["']?(?:media-user-token|music-user-token|musicUserToken|userToken)["']?\s*[:=]\s*["']?([A-Za-z0-9._=-]{40,})/i,
       /motw-pref:media-user-token[^A-Za-z0-9._=-]*["']?([A-Za-z0-9._=-]{40,})/i
     ];
 
@@ -83,7 +93,148 @@ APPLE_CAPTURE_JS = r"""
       if (match && rememberToken(match[1], source)) return true;
     }
 
+    var storefrontPatterns = [
+      /["']?(?:storefront|storefrontId|storefrontCountryCode)["']?\s*[:=]\s*["']?([A-Za-z]{2})/i,
+      /music\.apple\.com\/([a-z]{2})(?:\/|$)/i
+    ];
+
+    for (var j = 0; j < storefrontPatterns.length; j++) {
+      var storefrontMatch = text.match(storefrontPatterns[j]);
+      if (storefrontMatch) rememberStorefront(storefrontMatch[1], source);
+    }
+
     return false;
+  }
+
+  function inspectHeaderValue(source, key, value) {
+    key = String(key || '').toLowerCase();
+    if (!key) return;
+    if (key === 'music-user-token' || key === 'media-user-token') {
+      rememberToken(value, source + ':' + key);
+      rememberAuthorized(true, source + ':' + key);
+    } else if (key === 'authorization') {
+      considerText(key + '=' + value, source);
+    } else if (key === 'cookie') {
+      considerText(value, source + ':cookie');
+    }
+  }
+
+  function inspectHeaders(source, headers) {
+    if (!headers) return;
+    try {
+      if (typeof headers.forEach === 'function') {
+        headers.forEach(function(value, key) {
+          inspectHeaderValue(source, key, value);
+        });
+        return;
+      }
+    } catch (e) {}
+    try {
+      if (Array.isArray(headers)) {
+        for (var i = 0; i < headers.length; i++) {
+          inspectHeaderValue(source, headers[i][0], headers[i][1]);
+        }
+        return;
+      }
+    } catch (e) {}
+    try {
+      Object.keys(headers).forEach(function(key) {
+        inspectHeaderValue(source, key, headers[key]);
+      });
+    } catch (e) {}
+  }
+
+  function hookStorage(name) {
+    try {
+      var storage = window[name];
+      if (!storage || storage.__ptAppleWrapped) return;
+      var proto = Object.getPrototypeOf(storage);
+      if (!proto || proto.__ptAppleWrapped) return;
+      var originalSetItem = proto.setItem;
+      proto.setItem = function(key, value) {
+        considerText(String(key || '') + '=' + String(value || ''), name + '.setItem');
+        return originalSetItem.apply(this, arguments);
+      };
+      proto.__ptAppleWrapped = true;
+      storage.__ptAppleWrapped = true;
+    } catch (e) {}
+  }
+
+  function installRequestHooks() {
+    if (window.__ptAppleHooksInstalled) return;
+    window.__ptAppleHooksInstalled = true;
+
+    hookStorage('localStorage');
+    hookStorage('sessionStorage');
+
+    try {
+      var originalOpen = window.open;
+      window.open = function(url, target, features) {
+        var text = String(url || '');
+        if (/apple\.com|idmsa\.apple\.com|itunes\.apple\.com/i.test(text)) {
+          window.location.href = text;
+          return window;
+        }
+        return originalOpen ? originalOpen.apply(window, arguments) : null;
+      };
+    } catch (e) {}
+
+    try {
+      var originalFetch = window.fetch;
+      if (typeof originalFetch === 'function') {
+        window.fetch = function(input, init) {
+          try {
+            var requestUrl = typeof input === 'string' ? input : (input && input.url) || '';
+            considerUrl(requestUrl, 'fetch');
+            inspectHeaders('fetch:init', init && init.headers);
+            inspectHeaders('fetch:request', input && input.headers);
+          } catch (e) {}
+
+          return originalFetch.apply(this, arguments).then(function(response) {
+            try {
+              if (response && response.url) considerUrl(response.url, 'fetch:response');
+              if (response && response.headers) inspectHeaders('fetch:response', response.headers);
+            } catch (e) {}
+            return response;
+          });
+        };
+      }
+    } catch (e) {}
+
+    try {
+      var proto = window.XMLHttpRequest && window.XMLHttpRequest.prototype;
+      if (proto && !proto.__ptAppleWrapped) {
+        var originalOpen = proto.open;
+        var originalSetRequestHeader = proto.setRequestHeader;
+        proto.open = function(method, url) {
+          this.__ptAppleUrl = url || '';
+          this.__ptAppleHeaders = {};
+          considerUrl(url || '', 'xhr:open');
+          return originalOpen.apply(this, arguments);
+        };
+        proto.setRequestHeader = function(name, value) {
+          this.__ptAppleHeaders = this.__ptAppleHeaders || {};
+          this.__ptAppleHeaders[name] = value;
+          inspectHeaderValue('xhr:header', name, value);
+          return originalSetRequestHeader.apply(this, arguments);
+        };
+        proto.send = (function(originalSend) {
+          return function() {
+            try {
+              inspectHeaders('xhr:send', this.__ptAppleHeaders || {});
+              var self = this;
+              this.addEventListener('loadend', function() {
+                try {
+                  considerUrl(self.responseURL || self.__ptAppleUrl || '', 'xhr:response');
+                } catch (e) {}
+              }, { once: true });
+            } catch (e) {}
+            return originalSend.apply(this, arguments);
+          };
+        })(proto.send);
+        proto.__ptAppleWrapped = true;
+      }
+    } catch (e) {}
   }
 
   function scanStorage(name) {
@@ -94,15 +245,69 @@ APPLE_CAPTURE_JS = r"""
         var key = storage.key(i);
         var value = storage.getItem(key);
         var keyLower = String(key || '').toLowerCase();
-        if (keyLower.includes('media-user-token') || keyLower.includes('music-user-token') || keyLower.includes('musicusertoken')) {
-          considerText(value, name + ':' + key);
-          considerText(key + '=' + value, name + ':' + key);
-        }
-        if (keyLower.includes('storefront') || /storefront/i.test(String(value || ''))) {
+        if (
+          keyLower.includes('media-user-token') ||
+          keyLower.includes('music-user-token') ||
+          keyLower.includes('musicusertoken') ||
+          keyLower.includes('storefront') ||
+          keyLower.includes('itfe')
+        ) {
           considerText(key + '=' + value, name + ':' + key);
         }
       }
     } catch (e) {}
+  }
+
+  function inspectObjectTree(value, source, depth, seen) {
+    if (depth > 2 || value == null) return;
+    if (typeof value === 'string') {
+      considerText(value, source);
+      return;
+    }
+    if (typeof value !== 'object') return;
+
+    try {
+      if (seen && seen.has(value)) return;
+      if (seen) seen.add(value);
+    } catch (e) {}
+
+    var keys = [];
+    try {
+      keys = Object.keys(value).slice(0, 40);
+    } catch (e) {
+      return;
+    }
+
+    for (var i = 0; i < keys.length; i++) {
+      var key = keys[i];
+      var child;
+      try {
+        child = value[key];
+      } catch (e) {
+        continue;
+      }
+
+      var keyLower = String(key || '').toLowerCase();
+      if (
+        keyLower.includes('token') ||
+        keyLower.includes('storefront') ||
+        keyLower.includes('itfe') ||
+        keyLower.includes('authorize') ||
+        keyLower.includes('user')
+      ) {
+        considerText(key + '=' + child, source + '.' + key);
+      }
+
+      if (typeof child === 'object' && child && (
+        depth === 0 ||
+        keyLower.includes('storekit') ||
+        keyLower.includes('music') ||
+        keyLower.includes('api') ||
+        keyLower.includes('feature')
+      )) {
+        inspectObjectTree(child, source + '.' + key, depth + 1, seen);
+      }
+    }
   }
 
   function inspectMusicKit() {
@@ -110,9 +315,20 @@ APPLE_CAPTURE_JS = r"""
       if (!window.MusicKit || !window.MusicKit.getInstance) return;
       var instance = window.MusicKit.getInstance();
       if (!instance) return;
+
       if (instance.musicUserToken) rememberToken(instance.musicUserToken, 'musickit-instance');
+      if (instance.userToken) rememberToken(instance.userToken, 'musickit-instance');
+      if (instance.storekit && instance.storekit.userToken) rememberToken(instance.storekit.userToken, 'musickit-storekit');
       if (instance.storefrontId) rememberStorefront(instance.storefrontId, 'musickit-instance');
       if (instance.storefront && instance.storefront.id) rememberStorefront(instance.storefront.id, 'musickit-instance');
+      if (instance.storekit && instance.storekit.storefrontCountryCode) rememberStorefront(instance.storekit.storefrontCountryCode, 'musickit-storekit');
+      if (instance.authorizationStatus != null) rememberAuthorized(instance.authorizationStatus, 'musickit-instance');
+      if (instance.storekit && instance.storekit._authorizationStatus != null) rememberAuthorized(instance.storekit._authorizationStatus, 'musickit-storekit');
+      if (instance.storekit && instance.storekit.userTokenIsValid) rememberAuthorized(true, 'musickit-storekit');
+
+      var seen = typeof WeakSet === 'function' ? new WeakSet() : null;
+      inspectObjectTree(instance, 'musickit-instance', 0, seen);
+
     } catch (e) {}
   }
 
@@ -128,7 +344,9 @@ APPLE_CAPTURE_JS = r"""
     } catch (e) {}
   }
 
+  installRequestHooks();
   considerUrl(location.href, 'location');
+  considerText(location.hash || '', 'location.hash');
   considerText(document.cookie || '', 'document.cookie');
   scanStorage('localStorage');
   scanStorage('sessionStorage');
@@ -139,6 +357,7 @@ APPLE_CAPTURE_JS = r"""
     music_user_token: window.__ptAppleMusicUserToken || '',
     storefront: window.__ptAppleStorefront || '',
     itfe: window.__ptAppleItfe || '',
+    authorized: !!window.__ptAppleAuthorized,
     source: window.__ptAppleCaptureSource || '',
   });
 })();
@@ -213,6 +432,21 @@ def _remember_itfe(shared, value):
     shared["itfe"] = raw
 
 
+def _remember_authorized(shared, value):
+    raw = str(value or "").strip().upper()
+    if value is True or raw == "TRUE":
+        shared["authorized"] = True
+        return
+    try:
+        if int(str(value).strip()) >= 3:
+            shared["authorized"] = True
+            return
+    except Exception:
+        pass
+    if raw == "AUTHORIZED":
+        shared["authorized"] = True
+
+
 def _extract_cookie_header(cookies):
     pairs = []
     for cookie in cookies or []:
@@ -244,6 +478,7 @@ def check_session(window):
         "itfe": "",
         "cookie_header": "",
         "last_url": "",
+        "authorized": False,
         "closed": False,
     }
 
@@ -255,13 +490,17 @@ def check_session(window):
             pass
 
     def on_request(request):
-        _remember_from_url(shared, getattr(request, "url", ""))
-        _remember_itfe(shared, re.search(r"[?&]itfe=([^&]+)", str(getattr(request, "url", ""))) and re.search(r"[?&]itfe=([^&]+)", str(getattr(request, "url", ""))).group(1))
+        request_url = str(getattr(request, "url", ""))
+        _remember_from_url(shared, request_url)
+        itfe_match = re.search(r"[?&]itfe=([^&]+)", request_url)
+        if itfe_match:
+            _remember_itfe(shared, itfe_match.group(1))
         headers = getattr(request, "headers", {}) or {}
         for name, value in headers.items():
             lowered = str(name or "").lower()
             if lowered in ("media-user-token", "music-user-token"):
                 _remember_user_token(shared, value)
+                _remember_authorized(shared, True)
             elif lowered == "cookie":
                 shared["cookie_header"] = str(value or "").strip()
 
@@ -309,6 +548,7 @@ def check_session(window):
                 f"token={'sim' if shared['music_user_token'] else 'nao'}; "
                 f"itfe={'sim' if shared['itfe'] else 'nao'}; "
                 f"cookie={'sim' if shared['cookie_header'] else 'nao'}; "
+                f"authorized={'sim' if shared['authorized'] else 'nao'}; "
                 f"storefront={shared['storefront'] or 'desconhecida'}"
             )
 
@@ -318,6 +558,7 @@ def check_session(window):
             _remember_user_token(shared, payload.get("music_user_token"))
             _remember_storefront(shared, payload.get("storefront"))
             _remember_itfe(shared, payload.get("itfe"))
+            _remember_authorized(shared, payload.get("authorized"))
         except Exception:
             pass
 
@@ -328,10 +569,11 @@ def check_session(window):
                 shared["cookie_header"] = cookie_header
             if cookie_user_token:
                 _remember_user_token(shared, cookie_user_token)
+                _remember_authorized(shared, True)
         except Exception:
             pass
 
-        if shared["music_user_token"]:
+        if shared["music_user_token"] or (shared["authorized"] and shared["cookie_header"]):
             print(
                 "APPLE_FOUND:"
                 + json.dumps(
@@ -340,6 +582,7 @@ def check_session(window):
                         "storefront": shared["storefront"] or "us",
                         "itfe": shared["itfe"],
                         "cookie_header": shared["cookie_header"],
+                        "authorized": shared["authorized"],
                         "last_url": shared["last_url"],
                     },
                     ensure_ascii=False,

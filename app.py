@@ -516,6 +516,29 @@ def auth_spotify_callback():
 DEEZER_APP_ID     = os.getenv("DEEZER_APP_ID", "")
 DEEZER_SECRET_KEY = os.getenv("DEEZER_SECRET_KEY", "")
 
+# Amazon Music Web API (closed beta)
+# Requer Security Profile ID habilitado pela Amazon Music + Login With Amazon.
+AMAZON_MUSIC_API_KEY = os.getenv("AMAZON_MUSIC_API_KEY", "").strip()
+AMAZON_LWA_CLIENT_ID = os.getenv("AMAZON_LWA_CLIENT_ID", "").strip()
+AMAZON_LWA_CLIENT_SECRET = os.getenv("AMAZON_LWA_CLIENT_SECRET", "").strip()
+AMAZON_MUSIC_COUNTRY_CODE = os.getenv("AMAZON_MUSIC_COUNTRY_CODE", "US").strip().upper() or "US"
+AMAZON_MUSIC_SCOPES = os.getenv(
+    "AMAZON_MUSIC_SCOPES",
+    "profile music::catalog music::library",
+).strip()
+
+
+def amazon_music_oauth_configured() -> bool:
+    return bool(AMAZON_MUSIC_API_KEY and AMAZON_LWA_CLIENT_ID)
+
+
+def amazon_music_redirect_uri() -> str:
+    return build_callback_url("amazon")
+
+
+def _amazon_oauth_error_redirect(error: str, role: str = "dest"):
+    return redirect(f"/oauth-callback?error={urllib.parse.quote(error)}&platform=amazon&role={urllib.parse.quote(role)}")
+
 @app.route("/auth/deezer")
 def auth_deezer():
     if not DEEZER_APP_ID:
@@ -599,6 +622,171 @@ def auth_deezer_callback():
         pass
 
     return redirect(f"/oauth-callback?sid={sid}&role={role}&display_name={urllib.parse.quote(display_name)}&platform=deezer")
+
+
+@app.route("/api/config/amazon-music")
+def amazon_music_config():
+    return jsonify({
+        "ok": True,
+        "api_key_configured": bool(AMAZON_MUSIC_API_KEY),
+        "oauth_configured": amazon_music_oauth_configured(),
+        "country_code": AMAZON_MUSIC_COUNTRY_CODE,
+        "scopes": AMAZON_MUSIC_SCOPES,
+        "oauth_redirect_uri": amazon_music_redirect_uri(),
+        "requires_amazon_enablement": True,
+    })
+
+
+@app.route("/api/config/amazon-music", methods=["POST"])
+def configure_amazon_music():
+    global AMAZON_MUSIC_API_KEY, AMAZON_LWA_CLIENT_ID, AMAZON_LWA_CLIENT_SECRET
+    global AMAZON_MUSIC_COUNTRY_CODE, AMAZON_MUSIC_SCOPES, BASE_URL
+
+    data = request.json or {}
+    api_key = str(data.get("api_key") or "").strip()
+    client_id = str(data.get("client_id") or "").strip()
+    client_secret = str(data.get("client_secret") or "").strip()
+    country_code = str(data.get("country_code") or "US").strip().upper() or "US"
+    scopes = str(data.get("scopes") or AMAZON_MUSIC_SCOPES).strip() or AMAZON_MUSIC_SCOPES
+    base_url = normalize_spotify_base_url(str(data.get("base_url") or "").strip() or get_base_url())
+
+    if not api_key.startswith("amzn1.application."):
+        return jsonify({"ok": False, "error": "Cole o Security Profile ID da Amazon. Ele comeca com amzn1.application."})
+    if not client_id.startswith("amzn1.application-oa2-client."):
+        return jsonify({"ok": False, "error": "Cole o Client ID do Login With Amazon. Ele comeca com amzn1.application-oa2-client."})
+    if any(char in client_secret for char in "\r\n"):
+        return jsonify({"ok": False, "error": "Client Secret da Amazon invalido."})
+
+    try:
+        _write_env_values({
+            "BASE_URL": base_url,
+            "AMAZON_MUSIC_API_KEY": api_key,
+            "AMAZON_LWA_CLIENT_ID": client_id,
+            "AMAZON_LWA_CLIENT_SECRET": client_secret,
+            "AMAZON_MUSIC_COUNTRY_CODE": country_code,
+            "AMAZON_MUSIC_SCOPES": scopes,
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Nao consegui salvar no .env: {exc}"})
+
+    BASE_URL = base_url
+    AMAZON_MUSIC_API_KEY = api_key
+    AMAZON_LWA_CLIENT_ID = client_id
+    AMAZON_LWA_CLIENT_SECRET = client_secret
+    AMAZON_MUSIC_COUNTRY_CODE = country_code
+    AMAZON_MUSIC_SCOPES = scopes
+    os.environ["BASE_URL"] = base_url
+    os.environ["AMAZON_MUSIC_API_KEY"] = api_key
+    os.environ["AMAZON_LWA_CLIENT_ID"] = client_id
+    os.environ["AMAZON_LWA_CLIENT_SECRET"] = client_secret
+    os.environ["AMAZON_MUSIC_COUNTRY_CODE"] = country_code
+    os.environ["AMAZON_MUSIC_SCOPES"] = scopes
+
+    return jsonify({
+        "ok": True,
+        "oauth_configured": True,
+        "oauth_redirect_uri": amazon_music_redirect_uri(),
+        "country_code": country_code,
+        "scopes": scopes,
+    })
+
+
+@app.route("/auth/amazon")
+def auth_amazon():
+    if not amazon_music_oauth_configured():
+        return _amazon_oauth_error_redirect("amazon_music_api_access_required", request.args.get("role", "dest"))
+
+    role = request.args.get("role", "dest")
+    state = secrets.token_urlsafe(16)
+    code_verifier, code_challenge = generate_spotify_pkce_pair()
+    oauth_states[state] = {
+        "role": role,
+        "platform": "amazon",
+        "code_verifier": code_verifier,
+    }
+
+    params = {
+        "client_id": AMAZON_LWA_CLIENT_ID,
+        "scope": AMAZON_MUSIC_SCOPES,
+        "response_type": "code",
+        "redirect_uri": amazon_music_redirect_uri(),
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+    }
+    return redirect("https://www.amazon.com/ap/oa?" + urllib.parse.urlencode(params))
+
+
+@app.route("/auth/amazon/callback")
+def auth_amazon_callback():
+    from services import amazon_music
+
+    code = request.args.get("code", "")
+    state = request.args.get("state", "")
+    error = request.args.get("error", "")
+
+    meta = oauth_states.pop(state, None)
+    role = (meta or {}).get("role", request.args.get("role", "dest"))
+
+    if error or not code:
+        return _amazon_oauth_error_redirect(error or "login_cancelled", role)
+    if not meta or meta.get("platform") != "amazon":
+        return _amazon_oauth_error_redirect("invalid_state", role)
+
+    token_payload = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": amazon_music_redirect_uri(),
+        "client_id": AMAZON_LWA_CLIENT_ID,
+        "code_verifier": meta.get("code_verifier", ""),
+    }
+    if AMAZON_LWA_CLIENT_SECRET:
+        token_payload["client_secret"] = AMAZON_LWA_CLIENT_SECRET
+
+    token_response = req_lib.post(
+        "https://api.amazon.com/auth/o2/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data=token_payload,
+        timeout=15,
+    )
+    if token_response.status_code != 200:
+        try:
+            print(f"[Amazon OAuth] token exchange failed: {token_response.status_code} {token_response.text[:300]}")
+        except Exception:
+            pass
+        return _amazon_oauth_error_redirect("amazon_lwa_token_exchange_failed", role)
+
+    token_data = token_response.json()
+    access_token = str(token_data.get("access_token") or "").strip()
+    if not access_token:
+        return _amazon_oauth_error_redirect("amazon_lwa_token_exchange_failed", role)
+
+    try:
+        info = amazon_music.validate(AMAZON_MUSIC_API_KEY, access_token, AMAZON_MUSIC_COUNTRY_CODE)
+    except Exception as exc:
+        message = str(exc)
+        try:
+            print(f"[Amazon OAuth] validation failed: {message[:300]}")
+        except Exception:
+            pass
+        lowered = message.lower()
+        if "permissao" in lowered or "beta fechado" in lowered or "403" in lowered:
+            return _amazon_oauth_error_redirect("amazon_music_api_not_enabled", role)
+        if "401" in lowered or "credenciais" in lowered:
+            return _amazon_oauth_error_redirect("amazon_music_auth_failed", role)
+        return _amazon_oauth_error_redirect("amazon_music_validation_failed", role)
+
+    sid = create_session(
+        "amazon",
+        api_key=AMAZON_MUSIC_API_KEY,
+        access_token=access_token,
+        refresh_token=token_data.get("refresh_token", ""),
+        country_code=info.get("country_code", AMAZON_MUSIC_COUNTRY_CODE),
+        auth_source="lwa",
+        display_name=info["display_name"],
+    )
+    display_name = urllib.parse.quote(info["display_name"])
+    return redirect(f"/oauth-callback?sid={sid}&role={role}&display_name={display_name}&platform=amazon")
 
 
 @app.route("/api/connect/spotify", methods=["POST"])
@@ -1103,72 +1291,55 @@ def _run_apple_guided_capture(role: str):
         "storefront": "",
         "cookie_header": "",
         "itfe": "",
-        "step": "running_webview",
+        "authorized": False,
+        "step": "opening_browser",
         "updated_at": time.time(),
     })
 
     try:
-        python_exe = sys.executable
-        script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "apple_webview.py")
-
-        completed = subprocess.run(
-            [python_exe, script_path],
-            capture_output=True,
-            text=True,
-            timeout=210,
-        )
-    except subprocess.TimeoutExpired:
-        attempt.update({
-            "status": "error",
-            "error": "A janela da Apple Music demorou muito e foi encerrada.",
-            "step": "timed_out",
-            "updated_at": time.time(),
-        })
-        return
+        import webbrowser as _webbrowser
+        _webbrowser.open("https://music.apple.com/br/new")
     except Exception as exc:
         attempt.update({
-            "status": "error",
-            "error": f"Erro abrindo a janela da Apple Music: {exc}",
-            "step": "automation_failed",
+            "step": "browser_open_failed",
+            "error": f"Nao consegui abrir o Apple Music no navegador: {exc}",
             "updated_at": time.time(),
         })
-        return
 
-    output = completed.stdout or ""
-    error_output = (completed.stderr or "").strip()
-    if completed.returncode not in (0, None):
-        attempt.update({
-            "status": "error",
-            "error": error_output or output.strip() or "Falha ao abrir a janela da Apple Music.",
-            "step": "automation_failed",
-            "updated_at": time.time(),
-        })
-        return
-
-    payload = {}
-    aborted = False
-    timed_out = False
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-        if line.startswith("APPLE_FOUND:"):
-            try:
-                payload = json.loads(line.split("APPLE_FOUND:", 1)[1].strip())
-            except Exception:
-                payload = {}
-        elif line.startswith("APPLE_ABORTED:"):
-            aborted = True
-        elif line.startswith("APPLE_TIMEOUT:"):
-            timed_out = True
-
-    music_user_token = str(payload.get("music_user_token") or "").strip()
-    storefront = str(payload.get("storefront") or "us").strip().lower() or "us"
-    cookie_header = str(payload.get("cookie_header") or "").strip()
-    itfe = str(payload.get("itfe") or "").strip()
-
-    if music_user_token and len(music_user_token) > 50:
+    last_error = ""
+    deadline = time.time() + 150
+    while time.time() < deadline:
         try:
             from services import apple_music
+            payload = apple_music.read_saved_apple_session()
+        except Exception as exc:
+            last_error = str(exc)
+            payload = {}
+
+        music_user_token = str(payload.get("music_user_token") or "").strip()
+        storefront = str(payload.get("storefront") or "br").strip().lower() or "br"
+        cookie_header = str(payload.get("cookie_header") or "").strip()
+        itfe = str(payload.get("itfe") or "").strip()
+        authorized = bool(music_user_token or cookie_header)
+
+        if not (music_user_token or cookie_header):
+            attempt.update({
+                "status": "pending",
+                "error": "",
+                "step": "waiting_browser_login",
+                "updated_at": time.time(),
+            })
+            time.sleep(2)
+            continue
+
+        try:
             developer_token, _ = get_apple_music_developer_token()
+            storefront = apple_music.fetch_storefront(
+                developer_token,
+                music_user_token=music_user_token,
+                cookie_header=cookie_header,
+                itfe=itfe,
+            ) or storefront
             apple_music.validate(
                 developer_token,
                 music_user_token,
@@ -1177,17 +1348,34 @@ def _run_apple_guided_capture(role: str):
                 itfe=itfe,
             )
         except Exception as exc:
+            last_error = str(exc)
+            if "apple_music_cloud_library_required" in last_error or "cloudlibrary" in last_error.lower():
+                attempt.update({
+                    "status": "error",
+                    "error": f"apple_music_validation_failed:{exc}",
+                    "music_user_token": music_user_token,
+                    "storefront": storefront,
+                    "cookie_header": cookie_header,
+                    "itfe": itfe,
+                    "authorized": authorized,
+                    "step": "cloud_library_required",
+                    "updated_at": time.time(),
+                })
+                return
+
             attempt.update({
-                "status": "error",
-                "error": f"apple_music_validation_failed:{exc}",
-                "music_user_token": "",
+                "status": "pending",
+                "error": "",
+                "music_user_token": music_user_token,
                 "storefront": storefront,
-                "cookie_header": "",
-                "itfe": "",
-                "step": "validation_failed",
+                "cookie_header": cookie_header,
+                "itfe": itfe,
+                "authorized": authorized,
+                "step": "waiting_valid_browser_session",
                 "updated_at": time.time(),
             })
-            return
+            time.sleep(2)
+            continue
 
         attempt.update({
             "status": "captured",
@@ -1196,33 +1384,16 @@ def _run_apple_guided_capture(role: str):
             "storefront": storefront,
             "cookie_header": cookie_header,
             "itfe": itfe,
+            "authorized": authorized,
             "step": "captured",
-            "updated_at": time.time(),
-        })
-        return
-
-    if aborted:
-        attempt.update({
-            "status": "error",
-            "error": "Voce fechou a janela da Apple Music antes de concluir o login.",
-            "step": "aborted",
-            "updated_at": time.time(),
-        })
-        return
-
-    if timed_out:
-        attempt.update({
-            "status": "error",
-            "error": "A janela da Apple Music ficou aberta, mas o login nao terminou a tempo.",
-            "step": "timed_out",
             "updated_at": time.time(),
         })
         return
 
     attempt.update({
         "status": "error",
-        "error": "missing_apple_user_token",
-        "step": "no_capture",
+        "error": last_error or "apple_browser_session_not_found",
+        "step": "timed_out",
         "updated_at": time.time(),
     })
 
@@ -1232,17 +1403,20 @@ def connect_apple_browser_guided_start():
     data = request.json or {}
     role = str(data.get("role") or "dest").strip() or "dest"
     apple_browser_guided[role] = {
-        "status": "pending",
-        "error": "",
+        "status": "error",
+        "error": "apple_browser_cookie_flow_disabled",
         "music_user_token": "",
         "storefront": "",
         "cookie_header": "",
         "itfe": "",
-        "step": "queued",
+        "authorized": False,
+        "step": "disabled",
         "updated_at": time.time(),
     }
-    threading.Thread(target=_run_apple_guided_capture, args=(role,), daemon=True).start()
-    return jsonify({"ok": True, "started": True})
+    return jsonify({
+        "ok": False,
+        "error": "Atualize a pagina e tente novamente. O login da Apple Music agora usa uma janela oficial do MusicKit, sem leitura do Chrome.",
+    })
 
 
 @app.route("/api/connect/apple/browser-guided/status")
@@ -1255,6 +1429,7 @@ def connect_apple_browser_guided_status():
         "storefront": "",
         "cookie_header": "",
         "itfe": "",
+        "authorized": False,
         "step": "idle",
         "updated_at": 0,
     }
@@ -1266,6 +1441,7 @@ def connect_apple_browser_guided_status():
         "storefront": data.get("storefront", ""),
         "cookie_header": data.get("cookie_header", ""),
         "itfe": data.get("itfe", ""),
+        "authorized": data.get("authorized", False),
         "step": data.get("step", "idle"),
         "updated_at": data.get("updated_at", 0),
     })
@@ -1443,13 +1619,13 @@ def connect_apple():
         if not developer_token:
             developer_token, _ = get_apple_music_developer_token()
 
-        if role == "src" and not (developer_token and music_user_token):
+        if role == "src" and not (developer_token and music_user_token) and not cookie_header:
             sid = create_session("apple", display_name="Apple Music (pública)", storefront=storefront)
             return jsonify({"ok": True, "sid": sid, "display_name": "Apple Music (pública)"})
 
         if not developer_token:
             raise ValueError("apple_musickit_not_configured")
-        if not music_user_token:
+        if not music_user_token and not cookie_header:
             raise ValueError("apple_music_user_token_required")
 
         info = apple_music.validate(
@@ -1535,11 +1711,15 @@ def connect_amazon():
     from services import amazon_music
 
     data = request.json or {}
-    api_key = (data.get("api_key") or os.getenv("AMAZON_MUSIC_API_KEY", "")).strip()
+    api_key = (data.get("api_key") or AMAZON_MUSIC_API_KEY or os.getenv("AMAZON_MUSIC_API_KEY", "")).strip()
     access_token = (data.get("access_token") or os.getenv("AMAZON_MUSIC_ACCESS_TOKEN", "")).strip()
-    country_code = (data.get("country_code") or os.getenv("AMAZON_MUSIC_COUNTRY_CODE", "US")).strip().upper() or "US"
+    country_code = (data.get("country_code") or AMAZON_MUSIC_COUNTRY_CODE or os.getenv("AMAZON_MUSIC_COUNTRY_CODE", "US")).strip().upper() or "US"
 
     try:
+        if not api_key or not access_token:
+            if amazon_music_oauth_configured():
+                raise ValueError("amazon_music_oauth_required")
+            raise ValueError("amazon_music_api_access_required")
         info = amazon_music.validate(api_key, access_token, country_code)
         sid = create_session(
             "amazon",
@@ -1632,9 +1812,15 @@ def api_platforms():
         apple_ready = False
     p["apple"]["auto_configured"] = apple_ready
     p["apple"]["installation_configured"] = p["apple"]["auto_configured"]
+    p["amazon"]["oauth_configured"] = amazon_music_oauth_configured()
+    p["amazon"]["oauth_redirect_uri"] = amazon_music_redirect_uri()
+    p["amazon"]["api_key_configured"] = bool(AMAZON_MUSIC_API_KEY)
+    p["amazon"]["country_code"] = AMAZON_MUSIC_COUNTRY_CODE
+    p["amazon"]["scopes"] = AMAZON_MUSIC_SCOPES
+    p["amazon"]["requires_amazon_enablement"] = True
     p["amazon"]["auto_configured"] = bool(
-        os.getenv("AMAZON_MUSIC_API_KEY", "").strip()
-        and os.getenv("AMAZON_MUSIC_ACCESS_TOKEN", "").strip()
+        AMAZON_MUSIC_API_KEY
+        and (os.getenv("AMAZON_MUSIC_ACCESS_TOKEN", "").strip() or AMAZON_LWA_CLIENT_ID)
     )
     p["tidal"]["auto_configured"] = True
     try:
@@ -1687,7 +1873,9 @@ def _read_playlist(platform: str, url: str, sid: str) -> tuple[str, list[dict]]:
 
     elif platform == "apple":
         from services import apple_music
-        return apple_music.read_playlist(url)
+        developer_token, _ = get_apple_music_developer_token()
+        storefront = sess.get("storefront") or os.environ.get("APPLE_MUSIC_STOREFRONT", "us")
+        return apple_music.read_playlist(url, developer_token=developer_token, storefront=storefront)
 
     elif platform == "tidal":
         from services import tidal
@@ -2013,8 +2201,8 @@ def run_transfer(job: dict, data: dict):
             storefront = dest_sess.get("storefront", "us")
             cookie_header = dest_sess.get("cookie_header", "")
             itfe = dest_sess.get("itfe", "")
-            if not developer_token or not music_user_token:
-                raise ValueError("Sessão da Apple Music não encontrada. Informe developer token e music user token.")
+            if not developer_token or not (music_user_token or cookie_header):
+                raise ValueError("Sessão da Apple Music não encontrada. Reconecte a Apple Music.")
 
             playlist_id = apple_music.create_playlist(
                 developer_token,
@@ -2090,7 +2278,7 @@ def run_transfer(job: dict, data: dict):
             api_key = dest_sess.get("api_key", "")
             access_token = dest_sess.get("access_token", "")
             if not api_key or not access_token:
-                raise ValueError("Sessão do Amazon Music não encontrada. Informe API key e access token.")
+                raise ValueError("Sessão do Amazon Music não encontrada. Conecte o Amazon Music novamente.")
 
             created = amazon_music.create_playlist(api_key, access_token, nome, "Transferida via PlayTransfer")
             playlist_id = created["id"]
@@ -2143,7 +2331,7 @@ def api_job_status(job_id):
 
 @app.route("/api/health")
 def health():
-    return jsonify({"status": "ok", "version": "1.2.5", "app": "PlayTransfer"})
+    return jsonify({"status": "ok", "version": "1.2.25", "app": "PlayTransfer"})
 
 if __name__ == "__main__":
     import webbrowser
