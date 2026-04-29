@@ -19,6 +19,7 @@ const state = {
   youtubeAutoConnecting: {},
   deezerCapturePolls: {},
   deezerTabsOpened: {},
+  soundcloudCapturePolls: {},
   platforms: {},
   jobId: null,
   eventIdx: 0,
@@ -72,10 +73,11 @@ function listenOAuthMessages() {
         status.textContent = message;
       }
       if (platform === 'spotify') resetSpotifyAutoBtn(role);
-      if (platform === 'amazon') resetPlatformAutoButton('amazon', role, 'Tentar novamente');
+      if (platform === 'amazon') resetPlatformAutoButton('amazon', role, 'Conectar Amazon Music');
       showToast(message, platform === 'amazon' && isAmazonOfficialAccessError(d.error) ? 'warn' : 'error');
       return;
     }
+
 
     if (d.role === 'src') {
       state.srcSid = d.sid;
@@ -679,6 +681,141 @@ async function connectSoundcloud(role) {
   }
 }
 
+async function connectSoundcloudSavedAccess(role) {
+  const r = await fetch('/api/connect/soundcloud', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ role, access_token: '' }),
+  });
+  const d = await r.json();
+  if (!d.ok) {
+    const lowered = String(d.error || '').toLowerCase();
+    if (lowered.includes('soundcloud_login_required')) return false;
+    throw new Error(d.error || 'Falha ao conectar SoundCloud');
+  }
+
+  if (role === 'src') { state.srcSid = d.sid; state.srcDisplayName = d.display_name; }
+  else { state.destSid = d.sid; state.destDisplayName = d.display_name; }
+  showToast('SoundCloud conectado!', 'success');
+  renderConnectForms();
+  checkTransferReady();
+  return true;
+}
+
+function autoConnectSoundcloud(role) {
+  const status = document.getElementById(`${role}-sc-status`);
+  const btn = document.getElementById(`${role}-soundcloud-auto-btn`);
+  state.soundcloudCapturePolls = state.soundcloudCapturePolls || {};
+
+  if (state.soundcloudCapturePolls[role]) {
+    clearTimeout(state.soundcloudCapturePolls[role]);
+    state.soundcloudCapturePolls[role] = null;
+  }
+
+  if (btn) {
+    btn.disabled = true;
+    btn.innerHTML = '<span class="spin-inline"></span> Conectando...';
+  }
+  if (status) {
+    status.innerHTML = '<span class="spin-inline"></span> Abrindo login oficial do SoundCloud...';
+  }
+
+  const startCapture = () => {
+    fetch('/api/capture/soundcloud-session', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ role }),
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        if (!d.ok) throw new Error(d.error || 'Falha ao abrir SoundCloud');
+        if (status) status.innerHTML = '<span class="spin-inline"></span> Uma janela de login vai abrir. Faça login no SoundCloud e aguarde — o app conecta sozinho.';
+
+        pollSoundcloudSession(role, 0);
+      })
+      .catch((err) => {
+        const message = humanizePlatformError(err.message || 'Falha ao abrir SoundCloud');
+        if (status) status.textContent = message;
+        showToast(message, 'error');
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '🔌 Tentar novamente';
+        }
+      });
+  };
+
+  if (role === 'dest') {
+    connectSoundcloudSavedAccess(role)
+      .then((connected) => {
+        if (!connected) startCapture();
+      })
+      .catch(() => startCapture());
+    return;
+  }
+
+  startCapture();
+}
+
+function pollSoundcloudSession(role, attempts) {
+  const status = document.getElementById(`${role}-sc-status`);
+  const btn = document.getElementById(`${role}-soundcloud-auto-btn`);
+  const maxAttempts = 180;
+
+  if (attempts > maxAttempts) {
+    if (status) status.textContent = 'Tempo esgotado. Abra o SoundCloud de novo e tente mais uma vez.';
+    if (btn) {
+      btn.disabled = false;
+      btn.innerHTML = '🔌 Tentar novamente';
+    }
+    return;
+  }
+
+  state.soundcloudCapturePolls = state.soundcloudCapturePolls || {};
+  state.soundcloudCapturePolls[role] = setTimeout(async () => {
+    try {
+      const r = await fetch(`/api/capture/soundcloud-session/status?role=${role}`);
+      const d = await r.json();
+
+      if (d.status === 'done' && d.connected && d.sid) {
+        const name = d.display_name || 'SoundCloud';
+        if (role === 'src') {
+          state.srcSid = d.sid;
+          state.srcDisplayName = name;
+        } else {
+          state.destSid = d.sid;
+          state.destDisplayName = name;
+        }
+        state.soundcloudCapturePolls[role] = null;
+        showToast(`SoundCloud conectado: ${name}`, 'success');
+        renderConnectForms();
+        checkTransferReady();
+        return;
+      }
+
+      if (d.status === 'error') {
+        const message = humanizePlatformError(d.error || 'Falha ao conectar SoundCloud');
+        if (status) status.textContent = message;
+        showToast(message, 'error');
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '🔌 Tentar novamente';
+        }
+        state.soundcloudCapturePolls[role] = null;
+        return;
+      }
+
+      if (status && (d.step === 'opening_webview' || d.step === 'waiting_browser_login')) {
+        status.innerHTML = '<span class="spin-inline"></span> Faça login na janela que abriu. O app conecta sozinho quando você entrar.';
+      }
+
+
+      pollSoundcloudSession(role, attempts + 1);
+    } catch {
+      pollSoundcloudSession(role, attempts + 1);
+    }
+  }, 1000);
+}
+
 async function connectApple(role) {
   const status = document.getElementById(`${role}-apple-status`);
   const developerToken = document.getElementById(`${role}-apple-developer-token`)?.value?.trim() || '';
@@ -806,18 +943,12 @@ function resetPlatformAutoButton(platform, role, label = '🔌 Tentar novamente'
   }
 }
 
-function autoConnectSoundcloud(role) {
-  return autoConnectSavedAccess({
-    platform: 'soundcloud',
-    role,
-    name: 'SoundCloud',
-    statusId: `${role}-sc-status`,
-    detailsId: role === 'src' ? `${role}-soundcloud-private-details` : `${role}-soundcloud-token-details`,
-    connect: connectSoundcloud,
-    fallbackMessage: role === 'src'
-      ? 'Se a playlist for privada, cole o token da conta no modo manual abaixo.'
-      : 'Para salvar no SoundCloud, esta instalacao precisa de um token da conta de destino. Deixei o modo manual aberto abaixo.',
-  });
+function normalizeExternalUrl(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return '';
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) return raw;
+  if (/^[a-z0-9.-]+\.[a-z]{2,}(?:\/|$)/i.test(raw)) return `https://${raw}`;
+  return raw;
 }
 
 function isAllowedOAuthMessageOrigin(origin) {
@@ -886,44 +1017,89 @@ function renderAmazonOfficialAccessNotice(role, rawMessage = '') {
   const status = document.getElementById(`${role}-amazon-status`);
   if (!status) return;
 
-  const configured = !!state.platforms.amazon?.oauth_configured;
   const notEnabled = String(rawMessage || '').toLowerCase().includes('not_enabled');
+  const configured = !!state.platforms.amazon?.oauth_configured;
   const copy = configured || notEnabled
-    ? 'A Amazon abriu o caminho oficial, mas ainda nao liberou a criacao de playlists nesta instalacao. Tente novamente mais tarde.'
-    : 'Essa integracao ainda nao esta ativa nesta instalacao. Assim que estiver, este mesmo botao conecta sua conta automaticamente.';
-  status.innerHTML = `
-    <div class="apple-library-unlock">
-      <div class="apple-library-unlock-title">Amazon Music ainda nao disponivel aqui</div>
-      <div class="apple-library-unlock-copy">${copy}</div>
-    </div>
-  `;
+    ? 'A Amazon abriu o caminho, mas ainda não liberou a criação de playlists nesta instalação. Tente novamente mais tarde.'
+    : 'Amazon Music ainda não está disponível nesta instalação.';
+
+  status.textContent = copy;
 }
 
 function autoConnectAmazon(role) {
-  if (state.platforms.amazon?.oauth_configured) {
-    const status = document.getElementById(`${role}-amazon-status`);
-    if (status) status.innerHTML = '<span class="spin-inline"></span> Abrindo Login With Amazon...';
-    openOAuthPopup('amazon', role);
-    return true;
-  }
+  // Igual ao Deezer: abre o webview de login e captura cookies de sessão
+  const status = document.getElementById(`${role}-amazon-status`);
+  const btn    = document.getElementById(`${role}-amazon-auto-btn`);
 
-  if (!state.platforms.amazon?.auto_configured) {
-    renderAmazonOfficialAccessNotice(role);
-    showToast(humanizePlatformError('amazon_music_api_access_required'), 'warn');
-    resetPlatformAutoButton('amazon', role, 'Conectar Amazon Music');
-    return false;
-  }
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin-inline"></span> Abrindo login da Amazon...'; }
+  if (status) status.innerHTML = '<span class="spin-inline"></span> Aguardando login na janela Amazon Music...';
 
-  return autoConnectSavedAccess({
-    platform: 'amazon',
-    role,
-    name: 'Amazon Music',
-    statusId: `${role}-amazon-status`,
-    detailsId: '',
-    connect: connectAmazon,
-    fallbackMessage: 'Amazon Music ainda nao esta disponivel nesta instalacao.',
-  });
+  fetch('/api/capture/amazon-session', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ role }),
+  })
+    .then(r => r.json())
+    .then(d => {
+      if (d.ok) {
+        pollAmazonSession(role, 0);
+      } else {
+        if (status) status.textContent = 'Erro ao abrir a janela de login.';
+        if (btn) { btn.disabled = false; btn.innerHTML = '🔌 Conectar Amazon Music'; }
+      }
+    })
+    .catch(() => {
+      if (status) status.textContent = 'Erro ao abrir a janela de login.';
+      if (btn) { btn.disabled = false; btn.innerHTML = '🔌 Conectar Amazon Music'; }
+    });
 }
+
+function pollAmazonSession(role, attempts) {
+  const status = document.getElementById(`${role}-amazon-status`);
+  const btn    = document.getElementById(`${role}-amazon-auto-btn`);
+  const MAX    = 180;
+
+  if (attempts > MAX) {
+    if (status) status.textContent = 'Tempo esgotado. Tente novamente.';
+    if (btn)    { btn.disabled = false; btn.innerHTML = '🔌 Conectar Amazon Music'; }
+    return;
+  }
+
+  setTimeout(async () => {
+    try {
+      const r = await fetch(`/api/capture/amazon-session/status?role=${role}`);
+      const d = await r.json();
+
+      if (d.status === 'done' && d.connected) {
+        const name = d.display_name || 'Amazon Music';
+        if (role === 'src') {
+          state.srcSid         = 'amazon-session';
+          state.srcDisplayName = name;
+        } else {
+          state.destSid         = 'amazon-session';
+          state.destDisplayName = name;
+        }
+        showToast(`Amazon Music conectado: ${name}`, 'success');
+        renderConnectForms();
+        checkTransferReady();
+        return;
+      }
+
+      if (d.status === 'error') {
+        if (status) status.textContent = d.error || 'Falha ao conectar. Tente novamente.';
+        if (btn)    { btn.disabled = false; btn.innerHTML = '🔌 Conectar Amazon Music'; }
+        return;
+      }
+
+      // Ainda rodando
+      pollAmazonSession(role, attempts + 1);
+    } catch {
+      pollAmazonSession(role, attempts + 1);
+    }
+  }, 1000);
+}
+
+
 
 async function startTidalConnect(role) {
   state.tidalPending = state.tidalPending || {};
@@ -953,7 +1129,7 @@ async function startTidalConnect(role) {
     }
 
     state.tidalPending[role] = d.login_id;
-    const loginUrl = d.verification_uri_complete || d.verification_uri || '';
+    const loginUrl = normalizeExternalUrl(d.verification_uri_complete || d.verification_uri || '');
     let opened = null;
     if (loginUrl) {
       opened = window.open(loginUrl, '_blank', 'noopener');
@@ -1031,6 +1207,10 @@ function disconnect(role) {
   state.tidalPending[role] = null;
   if (!state.youtubePending) state.youtubePending = {};
   state.youtubePending[role] = null;
+  if (state.soundcloudCapturePolls?.[role]) {
+    clearTimeout(state.soundcloudCapturePolls[role]);
+    state.soundcloudCapturePolls[role] = null;
+  }
   if (typeof resetAppleGuidedPoll === 'function') {
     resetAppleGuidedPoll(role);
   }
@@ -1554,103 +1734,20 @@ function makeYoutubeForm(role) {
 
 function makeSoundcloudForm(role) {
   const wrapper = document.createElement('div');
-  const detailsId = role === 'src' ? `${role}-soundcloud-private-details` : `${role}-soundcloud-token-details`;
-
-  if (role === 'src') {
-    const privateDetails = makeAdvancedDetails(
-      'Nao funcionou? Fazer manualmente',
-      makeManualCredentialsForm({
-        platform: 'soundcloud',
-        role,
-        title: 'Token opcional do SoundCloud',
-        subtitle: 'Use isso so se a playlist nao for publica.',
-        badges: ['Opcional', 'So para playlist privada'],
-        label: 'Cole aqui o access token do SoundCloud',
-        inputId: `${role}-soundcloud-token`,
-        placeholder: 'access_token...',
-        statusId: `${role}-sc-status`,
-        action: 'connectSoundcloud',
-        buttonLabel: 'Usar token do SoundCloud',
-        help: 'Se a playlist for publica, voce pode ignorar esta parte.',
-        steps: [
-          {
-            title: 'Veja se voce realmente precisa disso',
-            detail: 'Para playlist publica, pode ignorar esta parte. So use token se a playlist for privada.',
-          },
-          {
-            title: 'Copie o token da conta certa',
-            detail: 'Use um access token OAuth valido da conta do SoundCloud que pode ler essa playlist.',
-          },
-          {
-            title: 'Cole e confirme',
-            detail: 'Cole o token no campo abaixo para liberar o acesso privado.',
-          },
-        ],
-      }),
-      false
-    );
-    privateDetails.id = detailsId;
-
-    wrapper.appendChild(makeAutomaticConnectPanel({
-      platform: 'soundcloud',
-      role,
-      title: 'Conectar SoundCloud',
-      subtitle: 'Clique no botao abaixo. Para playlists publicas, o app prepara tudo sozinho.',
-      hint: 'Se a playlist for privada, o app avisa e deixa o modo manual logo abaixo.',
-      statusId: `${role}-sc-status`,
-      buttonLabel: '🔌 Conectar SoundCloud automaticamente',
-      action: `autoConnectSoundcloud('${role}')`,
-    }));
-    wrapper.appendChild(privateDetails);
-    return wrapper;
-  }
-
-  const tokenDetails = makeAdvancedDetails(
-    'Abrir token do SoundCloud',
-    makeManualCredentialsForm({
-      platform: 'soundcloud',
-      role,
-      title: 'Token do SoundCloud',
-      subtitle: 'Cole o token para permitir a criacao da playlist.',
-      badges: ['Avancado', 'Use a conta de destino'],
-      label: 'Cole aqui o access token do SoundCloud',
-      inputId: `${role}-soundcloud-token`,
-      placeholder: 'access_token...',
-      statusId: `${role}-sc-status`,
-      action: 'connectSoundcloud',
-      buttonLabel: 'Conectar SoundCloud',
-      help: 'Use o token da conta que vai receber a playlist.',
-      steps: [
-        {
-          title: 'Pegue o token certo',
-          detail: 'Obtenha um access token OAuth valido da conta do SoundCloud que vai receber a playlist.',
-        },
-        {
-          title: 'Cole no campo abaixo',
-          detail: 'Nao precisa editar o token. Pode colar inteiro como recebeu.',
-        },
-        {
-          title: 'Confirme a conexao',
-          detail: 'Depois disso, o app pode criar a playlist nessa conta.',
-        },
-      ],
-    }),
-    false
-  );
-  tokenDetails.id = detailsId;
-
   wrapper.appendChild(makeAutomaticConnectPanel({
     platform: 'soundcloud',
     role,
     title: 'Conectar SoundCloud',
-    subtitle: 'Clique no botao abaixo. Se esta instalacao ja tiver acesso salvo, o app conecta em um passo.',
-    hint: 'Se faltar autorizacao do SoundCloud, o app abre o fallback manual sem tirar voce da tela.',
+    subtitle: role === 'src'
+      ? 'Para playlists publicas, voce pode continuar sem login. Se precisar entrar, este botao usa o navegador principal e conecta sozinho.'
+      : 'Clique no botao abaixo. O app usa o navegador principal para contas com Google e conecta a conta sozinho.',
+    hint: 'O usuario final nao precisa preencher token, API key, pais da conta ou codigo manual.',
     statusId: `${role}-sc-status`,
-    buttonLabel: '🔌 Conectar SoundCloud automaticamente',
+    buttonLabel: '&#128268; Conectar SoundCloud automaticamente',
     action: `autoConnectSoundcloud('${role}')`,
   }));
-  wrapper.appendChild(tokenDetails);
   return wrapper;
+
 }
 
 function makeAppleForm(role) {
@@ -1704,25 +1801,21 @@ function makeAppleForm(role) {
 
 function makeAmazonForm(role) {
   const wrapper = document.createElement('div');
-  const apiReady = !!state.platforms.amazon?.auto_configured;
 
   wrapper.appendChild(makeAutomaticConnectPanel({
-    platform: 'amazon',
-    title: 'Conectar Amazon Music',
+    platform:    'amazon',
+    title:       'Conectar Amazon Music',
     role,
-    subtitle: apiReady
-      ? 'Clique no botao abaixo. O app abre o login oficial da Amazon e conecta a conta em um passo.'
-      : 'O app tenta conectar automaticamente, igual aos outros destinos.',
-    hint: apiReady
-      ? 'Voce nao precisa preencher token, pais da conta ou codigo manual.'
-      : '',
-    statusId: `${role}-amazon-status`,
-    buttonLabel: 'Conectar Amazon Music',
-    action: `autoConnectAmazon('${role}')`,
+    subtitle:    'Clique no botão abaixo. O app abre o login do Amazon Music e conecta a conta sozinho.',
+    hint:        'Faça login com sua conta Amazon normalmente. Não é necessário nenhum código ou token.',
+    statusId:    `${role}-amazon-status`,
+    buttonLabel: '🔌 Conectar Amazon Music automaticamente',
+    action:      `autoConnectAmazon('${role}')`,
   }));
 
   return wrapper;
 }
+
 
 function makeTidalForm(role) {
   const div = document.createElement('div');
@@ -2626,6 +2719,13 @@ function closeOAuthConsentModal() {
 }
 
 function launchOAuthPopup(platform, role) {
+  // Se Amazon não está configurada, abre o wizard de setup
+  // (igual ao Spotify que pede Client ID na primeira vez)
+  if (platform === 'amazon' && !state.platforms.amazon?.oauth_configured) {
+    openAmazonOAuthSetupModal(role);
+    return;
+  }
+
   const url = `/auth/${platform}?role=${role}`;
   const w = 520;
   const h = 640;
@@ -2640,6 +2740,7 @@ function launchOAuthPopup(platform, role) {
     window.location.href = url;
   }
 }
+
 
 function openOAuthPopup(platform, role) {
   const modal = ensureOAuthConsentModal();
@@ -3029,13 +3130,264 @@ function getAmazonRedirectUri() {
   return state.platforms.amazon?.oauth_redirect_uri || `${getSpotifySetupOrigin()}/auth/amazon/callback`;
 }
 
+function ensureAmazonOAuthSetupModal() {
+  let modal = document.getElementById('amazon-oauth-setup-modal');
+  if (modal) return modal;
+
+  modal = document.createElement('div');
+  modal.id = 'amazon-oauth-setup-modal';
+  modal.className = 'modal-backdrop consent-modal-backdrop';
+  modal.setAttribute('aria-hidden', 'true');
+  modal.innerHTML = `
+    <div class="modal consent-modal" role="dialog" aria-modal="true" aria-labelledby="amazon-oauth-setup-title">
+      <button type="button" class="modal-close" id="amazon-oauth-setup-close" aria-label="Fechar">×</button>
+      <div class="consent-platform-card">
+        <div class="consent-platform-icon">${PLATFORM_ICONS.amazon || ''}</div>
+        <div>
+          <div class="consent-platform-label">Setup do PlayTransfer</div>
+          <div class="consent-platform-role">Login oficial da Amazon</div>
+        </div>
+      </div>
+      <h2 id="amazon-oauth-setup-title">Ativar Amazon Music</h2>
+      <p>Faça isso uma vez e pronto. O app detecta as credenciais automaticamente assim que você navegar para o seu perfil no console da Amazon.</p>
+
+      <!-- Botão de captura automática -->
+      <div style="background:rgba(139,92,246,0.08);border:1px solid rgba(139,92,246,0.25);border-radius:10px;padding:14px 16px;margin-bottom:16px">
+        <div style="font-weight:600;margin-bottom:6px">⚡ Captura automática (recomendado)</div>
+        <div style="font-size:.85rem;opacity:.8;margin-bottom:10px">Clique no botão abaixo. Uma janela do console da Amazon vai abrir. Navegue até o seu Security Profile — o app preenche tudo sozinho.</div>
+        <button type="button" class="btn btn-secondary" id="amazon-auto-capture-btn" style="width:100%">🔍 Abrir console e capturar automaticamente</button>
+        <div class="connect-inline-status" id="amazon-auto-capture-status" style="margin-top:8px"></div>
+      </div>
+
+      <details style="margin-bottom:12px">
+        <summary style="cursor:pointer;font-size:.85rem;opacity:.7">Preencher manualmente (avançado)</summary>
+        <div style="padding-top:12px">
+          <div class="consent-points" style="margin-bottom:12px">
+            <div class="consent-point">
+              <span class="consent-point-mark">1</span>
+              <span>Acesse o <strong>console da Amazon</strong> e crie um Security Profile.</span>
+            </div>
+            <div class="consent-point">
+              <span class="consent-point-mark">2</span>
+              <span>Em <strong>Web Settings → Allowed Return URLs</strong>, cole o link abaixo e salve.</span>
+            </div>
+            <div class="consent-point">
+              <span class="consent-point-mark">3</span>
+              <span>Copie o <strong>Security Profile ID</strong> e o <strong>Client ID</strong> e cole nos campos abaixo.</span>
+            </div>
+          </div>
+          <label class="setup-field">
+            <span>Return URL — cole no painel da Amazon</span>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input class="form-input" id="amazon-oauth-setup-redirect-uri" readonly style="flex:1" />
+              <button type="button" class="btn btn-secondary" id="amazon-oauth-copy-redirect" style="white-space:nowrap">Copiar</button>
+            </div>
+          </label>
+          <label class="setup-field">
+            <span>Security Profile ID</span>
+            <input class="form-input" id="amazon-oauth-setup-api-key" autocomplete="off" placeholder="amzn1.application.xxxx" />
+          </label>
+          <label class="setup-field">
+            <span>Client ID</span>
+            <input class="form-input" id="amazon-oauth-setup-client-id" autocomplete="off" placeholder="amzn1.application-oa2-client.xxxx" />
+          </label>
+          <label class="setup-field">
+            <span>Client Secret (opcional)</span>
+            <input class="form-input" id="amazon-oauth-setup-client-secret" autocomplete="off" placeholder="Deixe vazio se não tiver" />
+          </label>
+        </div>
+      </details>
+
+      <div class="connect-inline-status" id="amazon-oauth-setup-status"></div>
+      <div class="consent-actions">
+        <button type="button" class="btn btn-secondary" id="amazon-oauth-open-dashboard">🔗 Abrir console</button>
+        <button type="button" class="btn btn-primary" id="amazon-oauth-save">Salvar e conectar</button>
+      </div>
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  const close = () => closeAmazonOAuthSetupModal();
+  modal.querySelector('#amazon-oauth-setup-close')?.addEventListener('click', close);
+  modal.addEventListener('click', (event) => { if (event.target === modal) close(); });
+
+  modal.querySelector('#amazon-oauth-copy-redirect')?.addEventListener('click', async () => {
+    const redirectUri = modal.querySelector('#amazon-oauth-setup-redirect-uri')?.value || getAmazonRedirectUri();
+    try {
+      await navigator.clipboard.writeText(redirectUri);
+      showToast('Return URL copiada.', 'success');
+    } catch {
+      showToast('Não consegui copiar automaticamente. Selecione e copie o texto.', 'warn');
+    }
+  });
+
+  modal.querySelector('#amazon-oauth-open-dashboard')?.addEventListener('click', () => {
+    window.open('https://developer.amazon.com/loginwithamazon/console/site/lwa/overview.html', '_blank', 'noopener');
+  });
+
+  modal.querySelector('#amazon-auto-capture-btn')?.addEventListener('click', () => startAmazonAutoCapture(modal));
+  modal.querySelector('#amazon-oauth-save')?.addEventListener('click', () => saveAmazonOAuthSetup());
+
+  return modal;
+}
+
+async function startAmazonAutoCapture(modal) {
+  const captureBtn    = modal.querySelector('#amazon-auto-capture-btn');
+  const captureStatus = modal.querySelector('#amazon-auto-capture-status');
+
+  if (captureBtn) { captureBtn.disabled = true; captureBtn.innerHTML = '<span class="spin-inline"></span> Abrindo console da Amazon...'; }
+  if (captureStatus) captureStatus.textContent = 'Aguardando — navegue até o seu Security Profile no console.';
+
+  try {
+    const r = await fetch('/api/capture/amazon-lwa', { method: 'POST' });
+    const d = await r.json();
+    if (!d.ok) throw new Error('Não foi possível iniciar a captura.');
+    pollAmazonCapture(modal, 0);
+  } catch (err) {
+    if (captureStatus) captureStatus.textContent = 'Erro ao abrir o console. Tente manualmente.';
+    if (captureBtn) { captureBtn.disabled = false; captureBtn.innerHTML = '🔍 Abrir console e capturar automaticamente'; }
+  }
+}
+
+function pollAmazonCapture(modal, attempts) {
+  const captureBtn    = modal.querySelector('#amazon-auto-capture-btn');
+  const captureStatus = modal.querySelector('#amazon-auto-capture-status');
+  const MAX_ATTEMPTS  = 200; // ~200 segundos
+
+  if (attempts > MAX_ATTEMPTS) {
+    if (captureStatus) captureStatus.textContent = 'Tempo esgotado. Preencha manualmente se necessário.';
+    if (captureBtn) { captureBtn.disabled = false; captureBtn.innerHTML = '🔍 Abrir console e capturar automaticamente'; }
+    return;
+  }
+
+  setTimeout(async () => {
+    try {
+      const r = await fetch('/api/capture/amazon-lwa/status');
+      const d = await r.json();
+
+      if (d.status === 'done' && d.client_id && d.security_profile_id) {
+        // Preenche os campos automaticamente
+        const apiKeyInput    = modal.querySelector('#amazon-oauth-setup-api-key');
+        const clientIdInput  = modal.querySelector('#amazon-oauth-setup-client-id');
+        if (apiKeyInput)   apiKeyInput.value   = d.security_profile_id;
+        if (clientIdInput) clientIdInput.value = d.client_id;
+
+        if (captureStatus) captureStatus.textContent = '✅ Credenciais capturadas! Clique em "Salvar e conectar".';
+        if (captureBtn) { captureBtn.disabled = false; captureBtn.innerHTML = '✅ Capturado'; }
+
+        // Abre o details manualmente para mostrar os campos preenchidos
+        const details = modal.querySelector('details');
+        if (details) details.open = true;
+
+        // Auto-salva se campos estiverem preenchidos
+        await saveAmazonOAuthSetup();
+        return;
+      }
+
+      if (d.status === 'error') {
+        if (captureStatus) captureStatus.textContent = d.error || 'Não foi possível capturar. Preencha manualmente.';
+        if (captureBtn) { captureBtn.disabled = false; captureBtn.innerHTML = '🔍 Tentar novamente'; }
+        return;
+      }
+
+      // Ainda rodando → continua polling
+      if (captureStatus) captureStatus.textContent = 'Aguardando — navegue até o seu Security Profile no console.';
+      pollAmazonCapture(modal, attempts + 1);
+    } catch {
+      pollAmazonCapture(modal, attempts + 1);
+    }
+  }, 1000);
+}
+
+
+
+function openAmazonOAuthSetupModal(role = 'dest') {
+  const modal = ensureAmazonOAuthSetupModal();
+  modal.dataset.role = role;
+  modal.querySelector('#amazon-oauth-setup-redirect-uri').value = getAmazonRedirectUri();
+  modal.querySelector('#amazon-oauth-setup-api-key').value = '';
+  modal.querySelector('#amazon-oauth-setup-client-id').value = '';
+  modal.querySelector('#amazon-oauth-setup-client-secret').value = '';
+  modal.querySelector('#amazon-oauth-setup-status').textContent = '';
+  const captureStatus = modal.querySelector('#amazon-auto-capture-status');
+  if (captureStatus) captureStatus.textContent = '';
+  const captureBtn = modal.querySelector('#amazon-auto-capture-btn');
+  if (captureBtn) { captureBtn.disabled = false; captureBtn.innerHTML = '🔍 Abrir console e capturar automaticamente'; }
+  modal.classList.add('open');
+  modal.setAttribute('aria-hidden', 'false');
+  document.body.classList.add('modal-open');
+}
+
+
+function closeAmazonOAuthSetupModal() {
+  const modal = document.getElementById('amazon-oauth-setup-modal');
+  if (!modal) return;
+  modal.classList.remove('open');
+  modal.setAttribute('aria-hidden', 'true');
+  document.body.classList.remove('modal-open');
+}
+
+async function saveAmazonOAuthSetup() {
+  const modal = ensureAmazonOAuthSetupModal();
+  const role = modal.dataset.role || 'dest';
+  const apiKey = modal.querySelector('#amazon-oauth-setup-api-key')?.value?.trim() || '';
+  const clientId = modal.querySelector('#amazon-oauth-setup-client-id')?.value?.trim() || '';
+  const clientSecret = modal.querySelector('#amazon-oauth-setup-client-secret')?.value?.trim() || '';
+  const status = modal.querySelector('#amazon-oauth-setup-status');
+  const saveBtn = modal.querySelector('#amazon-oauth-save');
+
+  if (!apiKey || !clientId) {
+    if (status) status.textContent = 'Cole o Security Profile ID e o Client ID antes de continuar.';
+    return;
+  }
+
+  if (saveBtn) { saveBtn.disabled = true; saveBtn.innerHTML = '<span class="spin-inline"></span> Salvando...'; }
+  if (status) status.textContent = 'Salvando configuração da Amazon...';
+
+  try {
+    const r = await fetch('/api/config/amazon-music', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        api_key: apiKey,
+        client_id: clientId,
+        client_secret: clientSecret,
+        country_code: 'US',
+        scopes: 'profile music::catalog music::library',
+        base_url: getSpotifySetupOrigin(),
+      }),
+    });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || 'Não foi possível salvar a configuração da Amazon Music.');
+
+    state.platforms.amazon = {
+      ...(state.platforms.amazon || {}),
+      oauth_configured: true,
+      auto_configured: true,
+      api_key_configured: true,
+      oauth_redirect_uri: d.oauth_redirect_uri || getAmazonRedirectUri(),
+    };
+    closeAmazonOAuthSetupModal();
+    showToast('Amazon Music ativado. Abrindo login agora.', 'success');
+    renderConnectForms();
+    setTimeout(() => openOAuthPopup('amazon', role), 250);
+  } catch (error) {
+    const message = humanizePlatformError(error?.message || 'Não foi possível salvar a configuração da Amazon Music.');
+    if (status) status.textContent = message;
+    showToast(message, 'error');
+  } finally {
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.textContent = 'Salvar e conectar'; }
+  }
+}
+
 async function copyAmazonRedirectUri(role) {
   const redirectUri = document.getElementById(`${role}-amazon-redirect-uri`)?.value || getAmazonRedirectUri();
   try {
     await navigator.clipboard.writeText(redirectUri);
     showToast('Return URL da Amazon copiada.', 'success');
   } catch {
-    showToast('Nao consegui copiar automaticamente. Selecione e copie o texto.', 'warn');
+    showToast('Não consegui copiar automaticamente. Selecione e copie o texto.', 'warn');
   }
 }
 
@@ -3112,6 +3464,21 @@ function humanizePlatformError(message) {
   }
 
   const lowered = raw.toLowerCase();
+
+  if (
+    (lowered.includes('amazon music') && lowered.includes('http 404')) ||
+    lowered.includes('erro ao criar playlist: http 404') ||
+    lowered.includes('nao consegui criar a playlist no amazon music com esta sessao')
+  ) {
+    return 'Nao consegui criar a playlist no Amazon Music com esta sessao. Reconecte o Amazon Music e tente novamente.';
+  }
+
+  if (
+    lowered.includes('criei a playlist no amazon music') &&
+    lowered.includes('nao consegui adicionar as musicas')
+  ) {
+    return 'Criei a playlist no Amazon Music, mas nao consegui adicionar as musicas com esta sessao. Reconecte o Amazon Music e tente novamente.';
+  }
 
   if (lowered.includes('playlist pode ter mais de 50')) {
     if (state.platforms.spotify?.oauth_configured) {
@@ -3266,8 +3633,17 @@ function humanizePlatformError(message) {
     return 'O login oficial do YouTube Music ainda nao foi ativado nesta instalacao.';
   }
 
-  if (lowered.includes('para usar soundcloud como destino') || (lowered.includes('soundcloud') && lowered.includes('access token'))) {
-    return 'Para usar o SoundCloud como destino aqui, cole o token da conta que vai receber a playlist.';
+  if (
+    lowered.includes('soundcloud_login_required') ||
+    lowered.includes('soundcloud_validation_failed') ||
+    lowered.includes('nao encontrei o login do soundcloud salvo') ||
+    lowered.includes('edge desta maquina bloqueou a leitura automatica do soundcloud') ||
+    lowered.includes('soundcloud_browser_token_not_found') ||
+    lowered.includes('playlist do soundcloud nao encontrada ou privada') ||
+    lowered.includes('para usar soundcloud como destino') ||
+    (lowered.includes('soundcloud') && lowered.includes('access token'))
+  ) {
+    return 'Abra o SoundCloud no Edge, entre com Google se for sua conta, e clique em conectar novamente.';
   }
 
   if (lowered.includes('developer token da apple music') || lowered.includes('music user token da apple music')) {
@@ -3280,27 +3656,27 @@ function humanizePlatformError(message) {
     lowered.includes('api key do amazon music') ||
     lowered.includes('access token do amazon music')
   ) {
-    return 'Amazon Music ainda nao esta disponivel nesta instalacao.';
+    return 'Amazon Music ainda não está disponível nesta instalação.';
   }
 
   if (lowered.includes('amazon_music_api_not_enabled')) {
-    return 'A Amazon abriu a conta, mas ainda nao liberou esta integracao para criar playlists aqui.';
+    return 'A Amazon abriu a conta, mas ainda não liberou esta integração para criar playlists aqui.';
   }
 
   if (lowered.includes('amazon_lwa_token_exchange_failed')) {
-    return 'A Amazon abriu o login, mas nao concluiu a autorizacao para o PlayTransfer. Tente novamente.';
+    return 'A Amazon abriu o login, mas não concluiu a autorização para o PlayTransfer. Tente novamente.';
   }
 
   if (lowered.includes('amazon_music_auth_failed')) {
-    return 'A Amazon Music recusou essa sessao. Tente conectar novamente.';
+    return 'A Amazon Music recusou essa sessão. Tente conectar novamente.';
   }
 
   if (lowered.includes('amazon_music_validation_failed')) {
-    return 'Consegui voltar da Amazon, mas ainda nao consegui confirmar a permissao para criar playlists aqui.';
+    return 'Consegui voltar da Amazon, mas ainda não consegui confirmar a permissão para criar playlists aqui.';
   }
 
   if (lowered.includes('beta fechado') && lowered.includes('amazon music')) {
-    return 'Amazon Music ainda nao esta disponivel nesta instalacao.';
+    return 'Amazon Music ainda não está disponível nesta instalação.';
   }
 
   if (lowered.includes('login do google foi cancelado')) {
@@ -3373,7 +3749,7 @@ function updateUrlHint() {
     soundcloud: 'Ex.: https://soundcloud.com/usuario/sets/nome-da-playlist',
     apple: 'Ex.: https://music.apple.com/br/playlist/nome/pl.xxxxxx',
     tidal: 'Ex.: https://listen.tidal.com/playlist/00000000-0000-0000-0000-000000000000',
-    amazon: 'Ex.: https://music.amazon.com/my/playlists/abcd1234',
+    amazon: 'Ex.: https://music.amazon.com.br/user-playlists/abcd1234',
   };
 
   let hint = hints[state.srcPlatform] || 'Cole o link completo da playlist.';

@@ -30,6 +30,7 @@ youtube_guided_logins: dict[str, dict] = {}
 spotify_browser_guided: dict[str, dict] = {}
 deezer_browser_guided: dict[str, dict] = {}
 apple_browser_guided: dict[str, dict] = {}
+soundcloud_browser_guided: dict[str, dict] = {}
 
 BASE_URL = os.getenv("BASE_URL", "").strip()
 APPLE_MUSIC_BOOTSTRAP_CACHE = {"token": "", "expires_at": 0.0, "source": ""}
@@ -161,6 +162,17 @@ def get_spotify_base_url() -> str:
 def build_callback_url(platform: str) -> str:
     base_url = get_spotify_base_url() if platform == "spotify" else get_base_url()
     return f"{base_url}/auth/{platform}/callback"
+
+
+def normalize_external_url(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", raw):
+        return raw
+    if re.match(r"^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/|$)", raw):
+        return f"https://{raw}"
+    return raw
 
 
 @app.route("/api/config/spotify-redirect")
@@ -688,6 +700,222 @@ def configure_amazon_music():
         "oauth_redirect_uri": amazon_music_redirect_uri(),
         "country_code": country_code,
         "scopes": scopes,
+    })
+
+
+
+# ─── Estado da sessão Amazon (cookie-based, igual ao Deezer) ────────────────
+AMAZON_SESSION_COOKIES: dict = {}
+amazon_session_attempt: dict = {}
+amazon_connections: dict = {}        # {"src": {...cookies}, "dest": {...cookies}}
+
+
+def _has_amazon_auth_cookie(cookies: dict) -> bool:
+    return any(str(name).startswith("at-") for name, value in (cookies or {}).items() if value)
+
+
+def _has_amazon_session_cookie(cookies: dict) -> bool:
+    return bool(
+        (cookies or {}).get("_access_token")
+        or _has_amazon_auth_cookie(cookies)
+        or any(str(name).startswith("ubid-") for name, value in (cookies or {}).items() if value)
+    )
+
+
+@app.route("/api/capture/amazon-session", methods=["POST"])
+def start_amazon_session_capture():
+    global amazon_session_attempt
+    if amazon_session_attempt.get("status") == "running":
+        return jsonify({"ok": True, "already_running": True})
+
+    role = (request.json or {}).get("role", "dest")
+    amazon_session_attempt = {
+        "status": "running",
+        "step": "opening_webview",
+        "role": role,
+        "display_name": "",
+        "error": "",
+        "updated_at": time.time(),
+    }
+
+    def _run_capture():
+        global amazon_session_attempt, amazon_connections
+        try:
+            python_exe  = sys.executable
+            script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "amazon_webview.py")
+            completed   = subprocess.run(
+                [python_exe, script_path],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        except subprocess.TimeoutExpired:
+            amazon_session_attempt.update({"status": "error", "error": "A janela de login demorou muito.", "step": "timed_out", "updated_at": time.time()})
+            return
+        except Exception as exc:
+            amazon_session_attempt.update({"status": "error", "error": str(exc), "step": "spawn_failed", "updated_at": time.time()})
+            return
+
+        output = completed.stdout or ""
+        cookies: dict = {}
+        aborted = False
+
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("AMAZON_SESSION_FOUND:"):
+                try:
+                    cookies = json.loads(line.split("AMAZON_SESSION_FOUND:", 1)[1])
+                except Exception:
+                    pass
+            elif "ABORTED" in line:
+                aborted = True
+
+        if _has_amazon_auth_cookie(cookies):
+            api_calls_raw = cookies.pop("_api_calls", "[]")
+            try:
+                api_calls = json.loads(api_calls_raw) if isinstance(api_calls_raw, str) else (api_calls_raw or [])
+                if api_calls:
+                    print("AMAZON_API_CALLS:" + json.dumps(api_calls[:20]), flush=True)
+            except Exception:
+                api_calls = []
+
+            display_name = "Amazon Music"
+            try:
+                from services import amazon_music_session as _amz_session
+                _amz_session._refresh_metadata(cookies, force=True)
+                if not cookies.get("_access_token"):
+                    raise ValueError("amazon_session_missing_access_token")
+                info = _amz_session.validate(cookies)
+                display_name = info.get("display_name", "Amazon Music")
+            except Exception:
+                if not cookies.get("_access_token"):
+                    amazon_session_attempt.update({
+                        "status": "error",
+                        "error": "A Amazon abriu o login, mas a sessao completa ainda nao ficou disponivel. Tente conectar novamente.",
+                        "step": "missing_access_token",
+                        "updated_at": time.time(),
+                    })
+                    return
+                ubid_value = next((str(value) for name, value in cookies.items() if str(name).startswith("ubid-") and value), "")
+                display_name = f"Amazon Music ({ubid_value[:8]}...)" if ubid_value else "Amazon Music"
+
+            _role = amazon_session_attempt.get("role", "dest")
+            amazon_connections[_role] = cookies
+            amazon_connections[_role]["_api_calls"] = api_calls
+            amazon_session_attempt.update({
+                "status": "done",
+                "step": "captured",
+                "display_name": display_name,
+                "updated_at": time.time(),
+            })
+        elif any(str(name).startswith("ubid-") for name, value in cookies.items() if value):
+            # Logado mas at-main não capturado (HttpOnly não exposto pelo webview)
+            amazon_session_attempt.update({"status": "error", "error": "Login detectado mas token de acesso não capturado. Tente novamente — o app vai tentar extrair automaticamente.", "step": "partial", "updated_at": time.time()})
+        elif aborted:
+            amazon_session_attempt.update({"status": "error", "error": "Janela fechada antes do login.", "step": "aborted", "updated_at": time.time()})
+        else:
+            amazon_session_attempt.update({"status": "error", "error": "Não consegui capturar a sessão. Faça login completo na janela que abre.", "step": "not_found", "updated_at": time.time()})
+
+
+    threading.Thread(target=_run_capture, daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
+@app.route("/api/capture/amazon-session/status")
+def amazon_session_capture_status():
+    role = request.args.get("role", "dest")
+    connected = _has_amazon_session_cookie(amazon_connections.get(role, {}))
+    return jsonify({"ok": True, "connected": connected, **amazon_session_attempt})
+
+
+@app.route("/api/connect/amazon-session", methods=["DELETE"])
+def disconnect_amazon_session():
+    role = (request.json or {}).get("role", "dest")
+    amazon_connections.pop(role, None)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/debug/amazon-api-calls")
+def debug_amazon_api_calls():
+    """Retorna as chamadas de API interceptadas pelo webview do Amazon Music."""
+    cookies = amazon_connections.get("dest", {})
+    api_calls = cookies.get("_api_calls", [])
+    return jsonify({
+        "ok": True,
+        "count": len(api_calls),
+        "api_calls": api_calls,
+        "has_at_main": _has_amazon_auth_cookie(cookies),
+    })
+
+
+
+
+@app.route("/api/debug/amazon-test")
+def debug_amazon_test():
+    import requests as _req
+    cookies = amazon_connections.get("dest", {})
+    if not cookies:
+        return jsonify({"error": "Sem cookies capturados"})
+
+    region = cookies.get("_region", "com")
+    csrf   = cookies.get("_csrf_token", "") or cookies.get("csrf-main", "") or cookies.get("session-token", "")
+    clean  = {k: v for k, v in cookies.items() if not k.startswith("_")}
+    base   = f"https://music.amazon.{region}"
+    hdrs   = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Referer": f"{base}/",
+        "Origin": base,
+        "anti-csrftoken-a2z": csrf,
+    }
+
+    tests = {}
+    # GET endpoints — busca + user info + playlists
+    get_paths = [
+        "/EU/v1/search?keywords=test&size=1&nextToken=&musicTerritory=US&locale=en_US",
+        "/EU/v1/playlists?size=10",
+        "/EU/v1/user/playlists?size=10",
+        "/EU/v1/mymusic/playlists?size=10",
+        "/EU/v1/mymusic/tracks?size=1",
+        "/EU/v1/catalog/search?keywords=test&size=1",
+        "/EU/v1/catalog/tracks?ids=B09X5RTFFB",
+        "/EU/v1/catalog/albums?ids=B09X5RTFFB",
+        "/v1/catalog/search?keywords=test&size=1",
+        "/v1/search?keywords=test&size=1",
+        "/api/v1/search?q=test",
+        "/musicv1/search?keywords=test",
+    ]
+    for path in get_paths:
+        url = base + path
+        try:
+            r = _req.get(url, headers=hdrs, cookies=clean, timeout=8, allow_redirects=False)
+            tests[f"GET {path}"] = {"status": r.status_code, "snippet": r.text[:150]}
+        except Exception as e:
+            tests[f"GET {path}"] = {"error": str(e)}
+
+    # POST para criar playlist
+    post_paths = [
+        "/EU/v1/playlists",
+        "/EU/v1/user/playlists",
+        "/EU/v1/mymusic/playlists",
+        "/v1/playlists",
+    ]
+    for path in post_paths:
+        url = base + path
+        try:
+            r = _req.post(url, headers=hdrs, cookies=clean, json={"title": "Test", "description": "test", "visibility": "PRIVATE"}, timeout=8, allow_redirects=False)
+            tests[f"POST {path}"] = {"status": r.status_code, "snippet": r.text[:150]}
+        except Exception as e:
+            tests[f"POST {path}"] = {"error": str(e)}
+
+    return jsonify({
+        "region": region,
+        "base": base,
+        "cookie_keys": list(clean.keys()),
+        "has_at_main": _has_amazon_auth_cookie(clean),
+        "csrf_present": bool(csrf),
+        "tests": tests,
     })
 
 
@@ -1589,7 +1817,7 @@ def connect_soundcloud():
             return jsonify({"ok": True, "sid": sid, "display_name": "SoundCloud (publico)"})
 
         if role == "dest" and not access_token:
-            raise ValueError("Para usar SoundCloud como destino, informe um access token.")
+            raise ValueError("soundcloud_login_required")
 
         info = soundcloud.validate(access_token or None)
         sid = create_session(
@@ -1601,6 +1829,134 @@ def connect_soundcloud():
         return jsonify({"ok": True, "sid": sid, "display_name": info["display_name"]})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)})
+
+
+def _run_soundcloud_guided_capture(role: str):
+    import subprocess, sys, json as _json
+    attempt = soundcloud_browser_guided.setdefault(role, {})
+    attempt.update({
+        "status": "running",
+        "error": "",
+        "sid": "",
+        "display_name": "",
+        "avatar": "",
+        "step": "opening_webview",
+        "updated_at": time.time(),
+    })
+
+    try:
+        webview_script = os.path.join(os.path.dirname(__file__), "soundcloud_webview.py")
+        proc = subprocess.run(
+            [sys.executable, webview_script],
+            capture_output=True, text=True, timeout=180,
+        )
+        output = (proc.stdout or "") + (proc.stderr or "")
+
+        access_token = ""
+        aborted = False
+
+        for line in output.splitlines():
+            line = line.strip()
+            if line.startswith("SC_TOKEN_FOUND:"):
+                access_token = line.split("SC_TOKEN_FOUND:", 1)[1].strip()
+            elif "ABORTED" in line or "TIMEOUT" in line:
+                aborted = True
+
+        if access_token:
+            from services import soundcloud
+            info = soundcloud.validate(access_token)
+            sid = create_session(
+                "soundcloud",
+                access_token=access_token,
+                display_name=info["display_name"],
+                avatar=info.get("avatar", ""),
+            )
+            attempt.update({
+                "status": "done",
+                "error": "",
+                "sid": sid,
+                "display_name": info["display_name"],
+                "avatar": info.get("avatar", ""),
+                "step": "captured",
+                "updated_at": time.time(),
+            })
+        elif aborted:
+            attempt.update({
+                "status": "error",
+                "error": "Janela fechada antes do login. Abra novamente e faça login no SoundCloud.",
+                "step": "aborted",
+                "updated_at": time.time(),
+            })
+        else:
+            attempt.update({
+                "status": "error",
+                "error": "Não consegui capturar o token do SoundCloud. Faça login completo na janela que abre.",
+                "step": "not_found",
+                "updated_at": time.time(),
+            })
+
+    except subprocess.TimeoutExpired:
+        attempt.update({
+            "status": "error",
+            "error": "Tempo esgotado aguardando login no SoundCloud. Tente novamente.",
+            "step": "timed_out",
+            "updated_at": time.time(),
+        })
+    except Exception as exc:
+        attempt.update({
+            "status": "error",
+            "error": f"Erro ao abrir a janela de login do SoundCloud: {exc}",
+            "step": "error",
+            "updated_at": time.time(),
+        })
+
+
+
+
+@app.route("/api/capture/soundcloud-session", methods=["POST"])
+def start_soundcloud_session_capture():
+    data = request.json or {}
+    role = str(data.get("role") or "dest").strip() or "dest"
+    current = soundcloud_browser_guided.get(role) or {}
+    if current.get("status") == "running" and time.time() - float(current.get("updated_at") or 0) < 180:
+        return jsonify({"ok": True, "already_running": True})
+
+    soundcloud_browser_guided[role] = {
+        "status": "running",
+        "error": "",
+        "sid": "",
+        "display_name": "",
+        "avatar": "",
+        "step": "queued",
+        "updated_at": time.time(),
+    }
+    threading.Thread(target=_run_soundcloud_guided_capture, args=(role,), daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
+@app.route("/api/capture/soundcloud-session/status")
+def soundcloud_session_capture_status():
+    role = str(request.args.get("role") or "dest").strip() or "dest"
+    data = soundcloud_browser_guided.get(role) or {
+        "status": "idle",
+        "error": "",
+        "sid": "",
+        "display_name": "",
+        "avatar": "",
+        "step": "idle",
+        "updated_at": 0,
+    }
+    return jsonify({
+        "ok": True,
+        "connected": bool(data.get("sid")),
+        "status": data.get("status", "idle"),
+        "error": data.get("error", ""),
+        "sid": data.get("sid", ""),
+        "display_name": data.get("display_name", ""),
+        "avatar": data.get("avatar", ""),
+        "step": data.get("step", "idle"),
+        "updated_at": data.get("updated_at", 0),
+    })
 
 
 @app.route("/api/connect/apple", methods=["POST"])
@@ -1749,8 +2105,8 @@ def connect_tidal_start():
         return jsonify({
             "ok": True,
             "login_id": login_id,
-            "verification_uri": login.verification_uri,
-            "verification_uri_complete": login.verification_uri_complete,
+            "verification_uri": normalize_external_url(login.verification_uri),
+            "verification_uri_complete": normalize_external_url(login.verification_uri_complete),
             "user_code": login.user_code,
             "expires_in": login.expires_in,
             "interval": login.interval,
@@ -1804,7 +2160,8 @@ def api_platforms():
     p["spotify"]["oauth_mode"] = "pkce" if (SPOTIFY_CLIENT_ID and not SPOTIFY_CLIENT_SECRET) else "server"
     p["spotify"]["oauth_redirect_uri"] = build_callback_url("spotify")
     p["deezer"]["oauth_configured"]  = bool(DEEZER_APP_ID and DEEZER_SECRET_KEY)
-    p["soundcloud"]["auto_configured"] = bool(os.getenv("SOUNDCLOUD_ACCESS_TOKEN", "").strip())
+    p["soundcloud"]["auto_configured"] = True
+    p["soundcloud"]["saved_token_configured"] = bool(os.getenv("SOUNDCLOUD_ACCESS_TOKEN", "").strip())
     apple_ready = False
     try:
         apple_ready = bool(get_apple_music_developer_token()[0])
@@ -1886,6 +2243,12 @@ def _read_playlist(platform: str, url: str, sid: str) -> tuple[str, list[dict]]:
 
     elif platform == "amazon":
         from services import amazon_music
+        from services import amazon_music_session
+        session_cookies = amazon_connections.get("src") or amazon_connections.get(sid) or amazon_connections.get("dest")
+        if session_cookies and _has_amazon_session_cookie(session_cookies):
+            return amazon_music_session.read_playlist(url, session_cookies)
+        if not (sess.get("api_key") and sess.get("access_token")):
+            raise ValueError("Conecte o Amazon Music para ler essa playlist.")
         return amazon_music.read_playlist(url, sess.get("api_key", ""), sess.get("access_token", ""))
 
     else:
@@ -2171,7 +2534,7 @@ def run_transfer(job: dict, data: dict):
             dest_sess = sessions.get(dest_sid, {})
             access_token = dest_sess.get("access_token", "")
             if not access_token:
-                raise ValueError("Sessão do SoundCloud não encontrada. Informe um access token.")
+                raise ValueError("Sessão do SoundCloud não encontrada. Reconecte o SoundCloud e tente novamente.")
 
             created = soundcloud.create_playlist(access_token, nome, "Transferida via PlayTransfer")
             playlist_id = created["id"]
@@ -2273,37 +2636,59 @@ def run_transfer(job: dict, data: dict):
 
         elif dest_platform == "amazon":
             from services import amazon_music
+            from services import amazon_music_session
 
-            dest_sess = sessions.get(dest_sid, {})
-            api_key = dest_sess.get("api_key", "")
-            access_token = dest_sess.get("access_token", "")
-            if not api_key or not access_token:
-                raise ValueError("Sessão do Amazon Music não encontrada. Conecte o Amazon Music novamente.")
+            # Modo 2: cookies de sessão capturados pelo webview (sem developer credentials)
+            session_cookies = amazon_connections.get("dest") or amazon_connections.get(dest_sid)
+            if session_cookies and _has_amazon_session_cookie(session_cookies):
+                # ── Unofficial cookie-based API ──────────────────────────────
+                emit(job, {"type": "status", "msg": "Criando playlist no Amazon Music..."})
+                created    = amazon_music_session.create_playlist(session_cookies, nome, "Transferida via PlayTransfer")
+                playlist_id = created["id"]
+                dest_url    = created["url"]
+                emit(job, {"type": "status", "msg": "Buscando músicas no Amazon Music..."})
 
-            created = amazon_music.create_playlist(api_key, access_token, nome, "Transferida via PlayTransfer")
-            playlist_id = created["id"]
-            dest_url = created["url"]
-            emit(job, {"type": "status", "msg": "Buscando músicas no Amazon Music..."})
+                for i, m in enumerate(musicas):
+                    track_id = amazon_music_session.search_track(session_cookies, m["titulo"], m["artista"])
+                    if track_id:
+                        ids_encontrados.append(track_id)
+                    else:
+                        falhas.append(m)
+                    emit(job, {"type": "track", "titulo": m["titulo"], "artista": m["artista"],
+                               "found": bool(track_id), "current": i + 1, "total": len(musicas)})
+                    time.sleep(0.10)
 
-            for i, m in enumerate(musicas):
-                track_id = amazon_music.search_track(
-                    api_key,
-                    access_token,
-                    m["titulo"],
-                    m["artista"],
-                    m.get("album", ""),
-                )
-                if track_id:
-                    ids_encontrados.append(track_id)
-                else:
-                    falhas.append(m)
-                emit(job, {"type": "track", "titulo": m["titulo"], "artista": m["artista"],
-                           "found": bool(track_id), "current": i + 1, "total": len(musicas)})
-                time.sleep(0.10)
+                if ids_encontrados:
+                    emit(job, {"type": "status", "msg": "Adicionando faixas..."})
+                    amazon_music_session.add_tracks(session_cookies, playlist_id, ids_encontrados)
 
-            if ids_encontrados:
-                emit(job, {"type": "status", "msg": "Adicionando faixas..."})
-                amazon_music.add_tracks(api_key, access_token, playlist_id, ids_encontrados)
+            else:
+                # Modo 1: OAuth oficial (fallback se configurado)
+                dest_sess    = sessions.get(dest_sid, {})
+                api_key      = dest_sess.get("api_key", "")
+                access_token = dest_sess.get("access_token", "")
+                if not api_key or not access_token:
+                    raise ValueError("Sessão do Amazon Music não encontrada. Conecte o Amazon Music novamente.")
+
+                created     = amazon_music.create_playlist(api_key, access_token, nome, "Transferida via PlayTransfer")
+                playlist_id = created["id"]
+                dest_url    = created["url"]
+                emit(job, {"type": "status", "msg": "Buscando músicas no Amazon Music..."})
+
+                for i, m in enumerate(musicas):
+                    track_id = amazon_music.search_track(api_key, access_token, m["titulo"], m["artista"], m.get("album", ""))
+                    if track_id:
+                        ids_encontrados.append(track_id)
+                    else:
+                        falhas.append(m)
+                    emit(job, {"type": "track", "titulo": m["titulo"], "artista": m["artista"],
+                               "found": bool(track_id), "current": i + 1, "total": len(musicas)})
+                    time.sleep(0.10)
+
+                if ids_encontrados:
+                    emit(job, {"type": "status", "msg": "Adicionando faixas..."})
+                    amazon_music.add_tracks(api_key, access_token, playlist_id, ids_encontrados)
+
 
         else:
             raise ValueError(f"Destino '{dest_platform}' ainda não suportado.")
@@ -2331,7 +2716,7 @@ def api_job_status(job_id):
 
 @app.route("/api/health")
 def health():
-    return jsonify({"status": "ok", "version": "1.2.25", "app": "PlayTransfer"})
+    return jsonify({"status": "ok", "version": "1.2.26", "app": "PlayTransfer"})
 
 if __name__ == "__main__":
     import webbrowser

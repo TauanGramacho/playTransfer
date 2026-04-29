@@ -10,6 +10,13 @@ from typing import Any
 
 import requests
 
+try:
+    import browser_cookie3
+    BROWSER_COOKIE3_AVAILABLE = True
+except ImportError:
+    browser_cookie3 = None
+    BROWSER_COOKIE3_AVAILABLE = False
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -24,6 +31,59 @@ KNOWN_CLIENT_IDS = [
     "a3e059563d7fd3372b49b37f00a00bcf",
     "2t9loNQH90kzJcsFCODdigxfp325aq4z",
 ]
+
+TOKEN_RE = re.compile(r"(?:OAuth|Bearer)\s+([A-Za-z0-9._~+/=-]{20,})", re.I)
+NAMED_TOKEN_RE = re.compile(
+    r"(?:oauth_token|access_token|oauthToken|accessToken)[\"']?\s*[:=]\s*[\"']?([A-Za-z0-9._~+/=%-]{20,})",
+    re.I,
+)
+
+
+def _available_cookie_loaders() -> list[tuple[str, object]]:
+    if not BROWSER_COOKIE3_AVAILABLE:
+        return []
+
+    browser_names = [
+        ("Edge", "edge"),
+        ("Chrome", "chrome"),
+        ("Brave", "brave"),
+        ("Firefox", "firefox"),
+        ("Opera", "opera"),
+        ("Vivaldi", "vivaldi"),
+    ]
+    loaders = []
+    for label, attr in browser_names:
+        loader = getattr(browser_cookie3, attr, None)
+        if callable(loader):
+            loaders.append((label, loader))
+    return loaders
+
+
+def _token_from_text(value: str) -> str:
+    text = str(value or "")
+    match = TOKEN_RE.search(text) or NAMED_TOKEN_RE.search(text)
+    if not match:
+        return ""
+    token = requests.utils.unquote(match.group(1).strip().strip("\"'"))
+    if len(token) < 20 or any(char.isspace() for char in token):
+        return ""
+    return token
+
+
+def _token_from_cookie(name: str, value: str) -> str:
+    lowered = str(name or "").strip().lower()
+    raw_value = str(value or "").strip()
+    if lowered in {
+        "oauth_token",
+        "soundcloud_oauth_token",
+        "soundcloud_access_token",
+        "access_token",
+        "sc_oauth_token",
+    }:
+        return _token_from_text(f"oauth_token={raw_value}") or raw_value
+    if "oauth" in lowered or "access" in lowered or "token" in lowered:
+        return _token_from_text(f"{name}={raw_value}")
+    return _token_from_text(raw_value)
 
 
 def _public_headers() -> dict[str, str]:
@@ -105,6 +165,46 @@ def _normalize_track(track: dict[str, Any]) -> dict[str, str] | None:
     return {"titulo": title, "artista": artist, "album": ""}
 
 
+def _clean(value: str) -> str:
+    text = str(value or "").lower()
+    text = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _score_track(track: dict[str, Any], titulo: str, artista: str, album: str = "") -> int:
+    normalized = _normalize_track(track) or {"titulo": "", "artista": "", "album": ""}
+    wanted_title = _clean(titulo)
+    wanted_artist = _clean(artista)
+    wanted_album = _clean(album)
+    found_title = _clean(normalized.get("titulo", ""))
+    found_artist = _clean(normalized.get("artista", ""))
+    found_album = _clean(normalized.get("album", ""))
+
+    score = 0
+    if wanted_title and found_title == wanted_title:
+        score += 70
+    elif wanted_title and (wanted_title in found_title or found_title in wanted_title):
+        score += 45
+    elif wanted_title:
+        wanted_words = set(wanted_title.split())
+        found_words = set(found_title.split())
+        if wanted_words:
+            score += int(35 * (len(wanted_words & found_words) / len(wanted_words)))
+
+    if wanted_artist and found_artist:
+        if wanted_artist == found_artist:
+            score += 25
+        elif wanted_artist in found_artist or found_artist in wanted_artist:
+            score += 18
+        elif set(wanted_artist.split()) & set(found_artist.split()):
+            score += 10
+
+    if wanted_album and found_album and (wanted_album == found_album or wanted_album in found_album):
+        score += 5
+    return score
+
+
 def _resolve_public_playlist(url: str) -> dict[str, Any]:
     client_id = _get_client_id()
     response = requests.get(
@@ -148,6 +248,90 @@ def validate(access_token: str | None = None) -> dict[str, str]:
 
     _get_client_id()
     return {"display_name": "SoundCloud (publico)", "avatar": ""}
+
+
+def _token_from_web_session(cookie_header: str) -> str:
+    if not cookie_header:
+        return ""
+    headers = {
+        **_public_headers(),
+        "Cookie": cookie_header,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+    for url in ("https://soundcloud.com/you/library", "https://soundcloud.com/discover"):
+        try:
+            response = requests.get(url, headers=headers, timeout=12)
+        except Exception:
+            continue
+        for name, value in response.headers.items():
+            if str(name).lower() == "set-cookie":
+                token = _token_from_text(value)
+                if token:
+                    return token
+        token = _token_from_text(response.text)
+        if token:
+            return token
+    return ""
+
+
+def read_saved_soundcloud_session() -> dict[str, str]:
+    """Try to read a SoundCloud web login saved in local browsers."""
+    if not BROWSER_COOKIE3_AVAILABLE:
+        raise ValueError("A leitura automatica do navegador ainda nao esta instalada nesta instalacao.")
+
+    errors = []
+
+    for browser_name, loader in _available_cookie_loaders():
+        try:
+            jar = loader(domain_name="soundcloud.com")
+        except Exception as exc:
+            errors.append((browser_name, type(exc).__name__, str(exc)))
+            continue
+
+        cookie_pairs = []
+        seen = set()
+        access_token = ""
+
+        for cookie in jar:
+            domain = str(getattr(cookie, "domain", "") or "").lower()
+            if "soundcloud.com" not in domain:
+                continue
+
+            name = str(getattr(cookie, "name", "") or "").strip()
+            value = str(getattr(cookie, "value", "") or "").strip()
+            if not name or not value:
+                continue
+
+            key = (domain, name)
+            if key not in seen:
+                seen.add(key)
+                cookie_pairs.append(f"{name}={value}")
+
+            if not access_token:
+                access_token = _token_from_cookie(name, value)
+
+        cookie_header = "; ".join(cookie_pairs)
+        if not access_token and cookie_header:
+            access_token = _token_from_web_session(cookie_header)
+
+        if access_token:
+            return {
+                "access_token": access_token,
+                "cookie_header": cookie_header,
+                "browser": browser_name,
+            }
+
+    edge_blocked = any(
+        browser_name == "Edge" and error_type == "RequiresAdminError"
+        for browser_name, error_type, _ in errors
+    )
+    if edge_blocked:
+        raise ValueError("O Edge desta maquina bloqueou a leitura automatica do SoundCloud.")
+
+    raise ValueError(
+        "Nao encontrei o login do SoundCloud salvo nos navegadores desta maquina. "
+        "Abra o SoundCloud no Edge, entre com Google e tente novamente."
+    )
 
 
 def read_playlist(url: str, access_token: str | None = None) -> tuple[str, list[dict[str, str]]]:
@@ -224,6 +408,13 @@ def search_track(access_token: str, titulo: str, artista: str = "", album: str =
             continue
         results = response.json()
         collection = results if isinstance(results, list) else results.get("collection") or []
+        ranked = sorted(
+            ((track, _score_track(track, titulo, artista, album)) for track in collection),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        if ranked and ranked[0][1] >= 35 and ranked[0][0].get("id"):
+            return str(ranked[0][0]["id"])
         for track in collection:
             track_id = track.get("id")
             if track_id:
@@ -262,11 +453,20 @@ def add_tracks(access_token: str, playlist_id: str, track_ids: list[str]) -> Non
     if not track_ids:
         return
 
+    tracks_payload = []
+    for track_id in track_ids:
+        try:
+            tracks_payload.append({"id": int(track_id)})
+        except Exception:
+            continue
+    if not tracks_payload:
+        return
+
     response = requests.put(
         f"{API_V1}/playlists/{playlist_id}",
         headers=_auth_headers(access_token),
-        json={"playlist": {"tracks": [{"id": int(track_id)} for track_id in track_ids]}},
-        timeout=20,
+        json={"playlist": {"tracks": tracks_payload}},
+        timeout=30,
     )
     if response.status_code not in (200, 201):
         raise ValueError(f"Nao foi possivel adicionar faixas no SoundCloud (HTTP {response.status_code}).")
