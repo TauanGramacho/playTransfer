@@ -8,3 +8,6 @@ env/
 .runtime/
 .idea/
 .vscode/
+server.out.log
+server.err.log
+.tmp_soundcloud_js/
