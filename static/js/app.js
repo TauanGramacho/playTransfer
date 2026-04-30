@@ -717,7 +717,7 @@ function autoConnectSoundcloud(role) {
     btn.innerHTML = '<span class="spin-inline"></span> Conectando...';
   }
   if (status) {
-    status.innerHTML = '<span class="spin-inline"></span> Abrindo login oficial do SoundCloud...';
+    status.innerHTML = '<span class="spin-inline"></span> Abrindo a janela de login do SoundCloud...';
   }
 
   const startCapture = () => {
@@ -729,8 +729,8 @@ function autoConnectSoundcloud(role) {
       .then((r) => r.json())
       .then((d) => {
         if (!d.ok) throw new Error(d.error || 'Falha ao abrir SoundCloud');
-        if (status) status.innerHTML = '<span class="spin-inline"></span> Uma janela de login vai abrir. Faça login no SoundCloud e aguarde — o app conecta sozinho.';
-
+        if (btn) btn.innerHTML = '<span class="spin-inline"></span> Conectando...';
+        if (status) status.innerHTML = '<span class="spin-inline"></span> Faça login no SoundCloud na janela aberta. Esta tela confirma sozinha quando a conta estiver pronta.';
         pollSoundcloudSession(role, 0);
       })
       .catch((err) => {
@@ -739,19 +739,10 @@ function autoConnectSoundcloud(role) {
         showToast(message, 'error');
         if (btn) {
           btn.disabled = false;
-          btn.innerHTML = '🔌 Tentar novamente';
+          btn.innerHTML = '&#128268; Tentar novamente';
         }
       });
   };
-
-  if (role === 'dest') {
-    connectSoundcloudSavedAccess(role)
-      .then((connected) => {
-        if (!connected) startCapture();
-      })
-      .catch(() => startCapture());
-    return;
-  }
 
   startCapture();
 }
@@ -759,13 +750,13 @@ function autoConnectSoundcloud(role) {
 function pollSoundcloudSession(role, attempts) {
   const status = document.getElementById(`${role}-sc-status`);
   const btn = document.getElementById(`${role}-soundcloud-auto-btn`);
-  const maxAttempts = 180;
+  const maxAttempts = role === 'dest' ? 115 : 260;
 
   if (attempts > maxAttempts) {
-    if (status) status.textContent = 'Tempo esgotado. Abra o SoundCloud de novo e tente mais uma vez.';
+    if (status) status.textContent = 'Tempo esgotado aguardando o SoundCloud liberar a sessao web. Tente conectar novamente.';
     if (btn) {
       btn.disabled = false;
-      btn.innerHTML = '🔌 Tentar novamente';
+      btn.innerHTML = '&#128268; Tentar novamente';
     }
     return;
   }
@@ -798,16 +789,19 @@ function pollSoundcloudSession(role, attempts) {
         showToast(message, 'error');
         if (btn) {
           btn.disabled = false;
-          btn.innerHTML = '🔌 Tentar novamente';
+          btn.innerHTML = '&#128268; Tentar novamente';
         }
         state.soundcloudCapturePolls[role] = null;
         return;
       }
 
-      if (status && (d.step === 'opening_webview' || d.step === 'waiting_browser_login')) {
-        status.innerHTML = '<span class="spin-inline"></span> Faça login na janela que abriu. O app conecta sozinho quando você entrar.';
+      if (status && d.step === 'opening_webview') {
+        status.innerHTML = '<span class="spin-inline"></span> Abrindo a janela guiada do SoundCloud para concluir o login automaticamente.';
+      } else if (status && d.step === 'waiting_browser_login') {
+        status.innerHTML = '<span class="spin-inline"></span> Aguardando login no SoundCloud pela janela guiada.';
+      } else if (status && d.step === 'checking_web_session') {
+        status.innerHTML = '<span class="spin-inline"></span> Conferindo se o SoundCloud liberou permissao para criar playlists.';
       }
-
 
       pollSoundcloudSession(role, attempts + 1);
     } catch {
@@ -1739,8 +1733,8 @@ function makeSoundcloudForm(role) {
     role,
     title: 'Conectar SoundCloud',
     subtitle: role === 'src'
-      ? 'Para playlists publicas, voce pode continuar sem login. Se precisar entrar, este botao usa o navegador principal e conecta sozinho.'
-      : 'Clique no botao abaixo. O app usa o navegador principal para contas com Google e conecta a conta sozinho.',
+      ? 'Para playlists publicas, voce pode continuar sem login. Se precisar entrar, este botao conecta a conta.'
+      : 'Clique no botao abaixo. O app abre a janela de login do SoundCloud e conecta a conta sozinho.',
     hint: 'O usuario final nao precisa preencher token, API key, pais da conta ou codigo manual.',
     statusId: `${role}-sc-status`,
     buttonLabel: '&#128268; Conectar SoundCloud automaticamente',
@@ -1748,6 +1742,112 @@ function makeSoundcloudForm(role) {
   }));
   return wrapper;
 
+}
+
+function getSoundcloudRedirectUri() {
+  return state.platforms.soundcloud?.oauth_redirect_uri || `${getSpotifySetupOrigin()}/auth/soundcloud/callback`;
+}
+
+function makeSoundcloudOfficialSetup(role) {
+  const redirectUri = getSoundcloudRedirectUri();
+  return makeFormPanel(`
+    <div class="manual-connect-header deezer-quick-header">
+      <div class="manual-connect-platform">
+        <div class="manual-connect-platform-icon">${PLATFORM_ICONS.soundcloud || ''}</div>
+        <div class="manual-connect-platform-copy">
+          <div class="manual-connect-title">Ativar SoundCloud oficial</div>
+          <div class="manual-connect-subtitle">O SoundCloud bloqueia criar playlists por sessao de navegador. Com OAuth oficial, este mesmo botao passa a conectar a conta em um clique.</div>
+        </div>
+      </div>
+    </div>
+    <div class="manual-connect-notice warning">
+      <div class="manual-connect-notice-copy">
+        <div class="manual-connect-notice-title">Configuracao unica da instalacao</div>
+        <div class="manual-connect-notice-body">Depois de salvar o app oficial, o usuario final nao precisa preencher token, API key, pais da conta ou codigo manual.</div>
+      </div>
+    </div>
+    <div class="form-group" style="margin-top:0;">
+      <label class="form-label" for="${role}-soundcloud-redirect-uri">Redirect URI para cadastrar no SoundCloud</label>
+      <input id="${role}-soundcloud-redirect-uri" class="form-input" readonly value="${escapeHtml(redirectUri)}" />
+      <div class="form-hint"><span>i</span><span>Cadastre este URL no app SoundCloud antes de salvar.</span></div>
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="${role}-soundcloud-client-id">Client ID do SoundCloud</label>
+      <input id="${role}-soundcloud-client-id" class="form-input" autocomplete="off" placeholder="Cole o Client ID aqui" />
+    </div>
+    <div class="form-group">
+      <label class="form-label" for="${role}-soundcloud-client-secret">Client Secret do SoundCloud</label>
+      <input id="${role}-soundcloud-client-secret" class="form-input" autocomplete="off" placeholder="Cole o Client Secret aqui" />
+    </div>
+    <div class="manual-connect-actions deezer-quick-actions">
+      <button class="btn btn-secondary btn-sm" type="button" onclick="copySoundcloudRedirectUri('${role}')">Copiar Redirect URI</button>
+      <button class="btn btn-secondary btn-sm" type="button" onclick="window.open('https://soundcloud.com/you/apps', '_blank', 'noopener')">Abrir apps do SoundCloud</button>
+      <button class="btn btn-primary btn-sm" type="button" id="${role}-soundcloud-oauth-save" onclick="saveSoundcloudOAuthSetup('${role}')">Salvar e conectar</button>
+    </div>
+    ${makeInlineStatus(`${role}-sc-status`)}
+  `);
+}
+
+async function copySoundcloudRedirectUri(role) {
+  const redirectUri = document.getElementById(`${role}-soundcloud-redirect-uri`)?.value || getSoundcloudRedirectUri();
+  try {
+    await navigator.clipboard.writeText(redirectUri);
+    showToast('Redirect URI do SoundCloud copiada.', 'success');
+  } catch {
+    showToast('Nao consegui copiar automaticamente. Selecione e copie o texto.', 'warn');
+  }
+}
+
+async function saveSoundcloudOAuthSetup(role) {
+  const status = document.getElementById(`${role}-sc-status`);
+  const saveBtn = document.getElementById(`${role}-soundcloud-oauth-save`);
+  const clientId = document.getElementById(`${role}-soundcloud-client-id`)?.value?.trim() || '';
+  const clientSecret = document.getElementById(`${role}-soundcloud-client-secret`)?.value?.trim() || '';
+
+  if (!clientId || !clientSecret) {
+    if (status) status.textContent = 'Cole o Client ID e o Client Secret do app SoundCloud antes de continuar.';
+    return;
+  }
+
+  if (saveBtn) {
+    saveBtn.disabled = true;
+    saveBtn.innerHTML = '<span class="spin-inline"></span> Salvando...';
+  }
+  if (status) status.textContent = 'Salvando SoundCloud oficial nesta instalacao...';
+
+  try {
+    const response = await fetch('/api/config/soundcloud-oauth', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        client_id: clientId,
+        client_secret: clientSecret,
+        base_url: getSpotifySetupOrigin(),
+      }),
+    });
+    const data = await response.json();
+    if (!data.ok) {
+      throw new Error(data.error || 'Nao foi possivel salvar a configuracao do SoundCloud.');
+    }
+
+    state.platforms.soundcloud = {
+      ...(state.platforms.soundcloud || {}),
+      oauth_configured: true,
+      oauth_redirect_uri: data.oauth_redirect_uri || getSoundcloudRedirectUri(),
+    };
+    showToast('SoundCloud oficial ativado. Abrindo login agora.', 'success');
+    renderConnectForms();
+    setTimeout(() => openOAuthPopup('soundcloud', role), 250);
+  } catch (error) {
+    const message = humanizePlatformError(error?.message || 'Nao foi possivel salvar a configuracao do SoundCloud.');
+    if (status) status.textContent = message;
+    showToast(message, 'error');
+  } finally {
+    if (saveBtn) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = 'Salvar e conectar';
+    }
+  }
 }
 
 function makeAppleForm(role) {
@@ -2605,7 +2705,7 @@ function checkTransferReady() {
 
 
 function getOAuthConsentCopy(platform, role) {
-  const names = { spotify: 'Spotify', deezer: 'Deezer', amazon: 'Amazon Music' };
+  const names = { spotify: 'Spotify', deezer: 'Deezer', amazon: 'Amazon Music', soundcloud: 'SoundCloud' };
   const name = names[platform] || 'servico';
   const action =
     role === 'src'
@@ -3519,6 +3619,14 @@ function humanizePlatformError(message) {
     return 'Reconecte o Spotify pelo login oficial antes de transferir para ele. O login antigo por navegador nao consegue criar playlist com estabilidade.';
   }
 
+  if (lowered.includes('spotify_oauth_missing_playlist_scope')) {
+    return 'O Spotify conectou, mas nao liberou permissao para criar playlists. Reconecte pelo login oficial e aceite a permissao de criar playlists.';
+  }
+
+  if (lowered.includes('spotify_oauth_reconnect_required_after_403')) {
+    return 'O Spotify recusou essa sessao OAuth para criar playlist. Reconecte o Spotify pelo login oficial e tente a transferencia novamente.';
+  }
+
   if (lowered.includes('spotify_profile_failed')) {
     return 'O Spotify autorizou, mas nao devolveu os dados da conta. Tente conectar novamente pelo login oficial.';
   }
@@ -3539,7 +3647,36 @@ function humanizePlatformError(message) {
     return 'O Spotify esta limitando essa conta agora. Aguarde alguns minutos e tente transferir novamente.';
   }
 
-  if (lowered.includes('http 403') || lowered.includes('bloqueou a criacao da playlist com esta sessao')) {
+  if (
+    lowered.includes('nao foi possivel criar playlist no soundcloud') ||
+    lowered.includes('nao foi possivel adicionar faixas no soundcloud') ||
+    lowered.includes('falha ao gerar playlist no soundcloud') ||
+    lowered.includes('falha ao incluir musicas no soundcloud') ||
+    lowered.includes('soundcloud com a sessao web') ||
+    lowered.includes('soundcloud recusou criar ou editar')
+  ) {
+    return 'O SoundCloud conectou e encontrou as musicas, mas recusou a criacao final da playlist nesta sessao. Reconecte o SoundCloud e tente iniciar a transferencia novamente.';
+  }
+
+  if (
+    lowered.includes('soundcloud_oauth_not_configured') ||
+    lowered.includes('soundcloud_oauth_required_for_destination')
+  ) {
+    return 'Conecte o SoundCloud pelo botao automatico antes de iniciar a transferencia.';
+  }
+
+  if (lowered.includes('soundcloud_token_exchange_failed')) {
+    return 'O SoundCloud abriu o login oficial, mas a troca de autorizacao falhou. Confira Client ID, Client Secret e Redirect URI do app SoundCloud.';
+  }
+
+  if (lowered.includes('soundcloud_profile_failed')) {
+    return 'O SoundCloud autorizou, mas nao devolveu os dados da conta. Tente conectar novamente pelo login oficial.';
+  }
+
+  if (
+    lowered.includes('spotify') &&
+    (lowered.includes('http 403') || lowered.includes('bloqueou a criacao da playlist com esta sessao'))
+  ) {
     return 'O Spotify bloqueou essa operacao com a sessao atual (erro 403). Tente reconectar o Spotify usando o login oficial OAuth.';
   }
 
@@ -3634,7 +3771,16 @@ function humanizePlatformError(message) {
   }
 
   if (
+    lowered.includes('nao consegui validar a sessao do soundcloud') ||
+    lowered.includes('access token do soundcloud invalido ou expirado') ||
+    lowered.includes('tempo esgotado aguardando a sessao web do soundcloud')
+  ) {
+    return 'Consegui abrir o SoundCloud, mas essa sessao ainda nao liberou permissao para criar playlists. Tente conectar novamente pela janela guiada.';
+  }
+
+  if (
     lowered.includes('soundcloud_login_required') ||
+    lowered.includes('soundcloud_web_session_required') ||
     lowered.includes('soundcloud_validation_failed') ||
     lowered.includes('nao encontrei o login do soundcloud salvo') ||
     lowered.includes('edge desta maquina bloqueou a leitura automatica do soundcloud') ||
@@ -3643,7 +3789,7 @@ function humanizePlatformError(message) {
     lowered.includes('para usar soundcloud como destino') ||
     (lowered.includes('soundcloud') && lowered.includes('access token'))
   ) {
-    return 'Abra o SoundCloud no Edge, entre com Google se for sua conta, e clique em conectar novamente.';
+    return 'Abra a janela de login do SoundCloud pelo botao, entre na sua conta e deixe o app confirmar sozinho.';
   }
 
   if (lowered.includes('developer token da apple music') || lowered.includes('music user token da apple music')) {

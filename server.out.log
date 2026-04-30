@@ -3,3 +3,7 @@ PlayTransfer rodando em http://localhost:5001
 
  * Serving Flask app 'app'
  * Debug mode: off
+[SoundCloud] login check: client_id=True cookies=48 candidates=6 me=401 browser_ok=True
+[SoundCloud] login check: client_id=True cookies=51 candidates=7 me=401 browser_ok=True
+[SoundCloud] login check: client_id=True cookies=49 candidates=7 me=HTTP 401 browser_ok=True
+[SoundCloud] login check: client_id=True cookies=50 candidates=8 me=401 browser_ok=True
