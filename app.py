@@ -100,7 +100,7 @@ PLATFORMS = {
     "spotify":    {"name": "Spotify",       "color": "#1DB954", "can_read": True, "can_write": True, "auth": "oauth_or_cookie"},
     "deezer":     {"name": "Deezer",        "color": "#A238FF", "can_read": True, "can_write": True, "auth": "oauth_or_cookie"},
     "youtube":    {"name": "YouTube Music", "color": "#FF0033", "can_read": True, "can_write": True, "auth": "oauth_or_cookie"},
-    "soundcloud": {"name": "SoundCloud",    "color": "#FF5500", "can_read": True, "can_write": True, "auth": "token_or_public"},
+    "soundcloud": {"name": "SoundCloud",    "color": "#FF5500", "can_read": True, "can_write": True, "auth": "oauth_or_public"},
     "apple":      {"name": "Apple Music",   "color": "#F5F5F7", "can_read": True, "can_write": True, "auth": "public_or_token"},
     "tidal":      {"name": "TIDAL",         "color": "#F5F5F7", "can_read": True, "can_write": True, "auth": "device_code"},
     "amazon":     {"name": "Amazon Music",  "color": "#00A8E1", "can_read": True, "can_write": True, "auth": "api_key_token"},
@@ -229,6 +229,15 @@ SPOTIFY_SCOPES        = (
     "user-read-private "
     "user-read-email"
 )
+SPOTIFY_REQUIRED_DEST_SCOPES = {"playlist-modify-private", "playlist-modify-public"}
+
+
+def spotify_scope_set(scope_text: str) -> set[str]:
+    return {scope.strip() for scope in str(scope_text or "").split() if scope.strip()}
+
+
+def spotify_has_destination_scopes(scope_text: str) -> bool:
+    return SPOTIFY_REQUIRED_DEST_SCOPES.issubset(spotify_scope_set(scope_text))
 
 
 def _write_env_values(updates: dict[str, str]) -> None:
@@ -411,6 +420,45 @@ def configure_spotify_oauth():
     })
 
 
+@app.route("/api/config/soundcloud-oauth", methods=["POST"])
+def configure_soundcloud_oauth():
+    global SOUNDCLOUD_CLIENT_ID, SOUNDCLOUD_CLIENT_SECRET, BASE_URL
+
+    data = request.json or {}
+    client_id = str(data.get("client_id") or "").strip()
+    client_secret = str(data.get("client_secret") or "").strip()
+    base_url = normalize_spotify_base_url(str(data.get("base_url") or "").strip() or get_base_url())
+
+    if len(client_id) < 10:
+        return jsonify({"ok": False, "error": "Cole o Client ID do app SoundCloud."})
+    if len(client_secret) < 10:
+        return jsonify({"ok": False, "error": "Cole o Client Secret do app SoundCloud."})
+    if any(char in client_id + client_secret for char in "\r\n"):
+        return jsonify({"ok": False, "error": "Client ID ou Client Secret invalido."})
+
+    try:
+        _write_env_values({
+            "BASE_URL": base_url,
+            "SOUNDCLOUD_CLIENT_ID": client_id,
+            "SOUNDCLOUD_CLIENT_SECRET": client_secret,
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": f"Nao consegui salvar no .env: {exc}"})
+
+    BASE_URL = base_url
+    SOUNDCLOUD_CLIENT_ID = client_id
+    SOUNDCLOUD_CLIENT_SECRET = client_secret
+    os.environ["BASE_URL"] = base_url
+    os.environ["SOUNDCLOUD_CLIENT_ID"] = client_id
+    os.environ["SOUNDCLOUD_CLIENT_SECRET"] = client_secret
+
+    return jsonify({
+        "ok": True,
+        "oauth_configured": True,
+        "oauth_redirect_uri": build_callback_url("soundcloud"),
+    })
+
+
 @app.route("/auth/spotify")
 def auth_spotify():
     if not SPOTIFY_CLIENT_ID:
@@ -489,6 +537,13 @@ def auth_spotify_callback():
 
     token_data = r.json()
     access_token = token_data.get("access_token", "")
+    granted_scopes = str(token_data.get("scope") or SPOTIFY_SCOPES).strip()
+    if role == "dest" and not spotify_has_destination_scopes(granted_scopes):
+        try:
+            print(f"[Spotify OAuth] missing playlist scopes. granted={granted_scopes!r}")
+        except Exception:
+            pass
+        return redirect("/oauth-callback?error=spotify_oauth_missing_playlist_scope&platform=spotify")
 
     # Busca info do usuário
     me_response = req_lib.get(
@@ -512,6 +567,7 @@ def auth_spotify_callback():
         "spotify",
         access_token=access_token,
         refresh_token=token_data.get("refresh_token", ""),
+        scopes=granted_scopes,
         auth_source="oauth",
         display_name=display_name,
         avatar=avatar,
@@ -527,6 +583,8 @@ def auth_spotify_callback():
 # ═════════════════════════════════════════════════════════════════════════════
 DEEZER_APP_ID     = os.getenv("DEEZER_APP_ID", "")
 DEEZER_SECRET_KEY = os.getenv("DEEZER_SECRET_KEY", "")
+SOUNDCLOUD_CLIENT_ID = os.getenv("SOUNDCLOUD_CLIENT_ID", "").strip()
+SOUNDCLOUD_CLIENT_SECRET = os.getenv("SOUNDCLOUD_CLIENT_SECRET", "").strip()
 
 # Amazon Music Web API (closed beta)
 # Requer Security Profile ID habilitado pela Amazon Music + Login With Amazon.
@@ -634,6 +692,97 @@ def auth_deezer_callback():
         pass
 
     return redirect(f"/oauth-callback?sid={sid}&role={role}&display_name={urllib.parse.quote(display_name)}&platform=deezer")
+
+
+@app.route("/auth/soundcloud")
+def auth_soundcloud():
+    if not SOUNDCLOUD_CLIENT_ID or not SOUNDCLOUD_CLIENT_SECRET:
+        return redirect("/oauth-callback?error=soundcloud_oauth_not_configured&platform=soundcloud")
+
+    role = request.args.get("role", "dest")
+    state = secrets.token_urlsafe(16)
+    code_verifier, code_challenge = generate_spotify_pkce_pair()
+    oauth_states[state] = {
+        "role": role,
+        "platform": "soundcloud",
+        "code_verifier": code_verifier,
+    }
+
+    params = {
+        "client_id": SOUNDCLOUD_CLIENT_ID,
+        "redirect_uri": build_callback_url("soundcloud"),
+        "response_type": "code",
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256",
+        "state": state,
+    }
+    url = "https://secure.soundcloud.com/authorize?" + urllib.parse.urlencode(params)
+    return redirect(url)
+
+
+@app.route("/auth/soundcloud/callback")
+def auth_soundcloud_callback():
+    from services import soundcloud
+
+    code = request.args.get("code", "")
+    state = request.args.get("state", "")
+    error = request.args.get("error", "")
+
+    meta = oauth_states.pop(state, None)
+    role = (meta or {}).get("role", request.args.get("role", "dest"))
+
+    if error or not code:
+        return redirect(f"/oauth-callback?error={urllib.parse.quote(error or 'login_cancelled')}&platform=soundcloud&role={urllib.parse.quote(role)}")
+    if not meta or meta.get("platform") != "soundcloud":
+        return redirect("/oauth-callback?error=invalid_state&platform=soundcloud")
+
+    r = req_lib.post(
+        "https://secure.soundcloud.com/oauth/token",
+        headers={
+            "accept": "application/json; charset=utf-8",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data={
+            "grant_type": "authorization_code",
+            "client_id": SOUNDCLOUD_CLIENT_ID,
+            "client_secret": SOUNDCLOUD_CLIENT_SECRET,
+            "redirect_uri": build_callback_url("soundcloud"),
+            "code_verifier": meta.get("code_verifier", ""),
+            "code": code,
+        },
+        timeout=15,
+    )
+    if r.status_code != 200:
+        try:
+            print(f"[SoundCloud OAuth] token exchange failed: {r.status_code} {r.text[:300]}")
+        except Exception:
+            pass
+        return redirect("/oauth-callback?error=soundcloud_token_exchange_failed&platform=soundcloud")
+
+    token_data = r.json()
+    access_token = token_data.get("access_token", "")
+    refresh_token = token_data.get("refresh_token", "")
+    if not access_token:
+        return redirect("/oauth-callback?error=soundcloud_token_exchange_failed&platform=soundcloud")
+
+    try:
+        info = soundcloud.validate(access_token)
+    except Exception as exc:
+        try:
+            print(f"[SoundCloud OAuth] profile failed: {exc}")
+        except Exception:
+            pass
+        return redirect("/oauth-callback?error=soundcloud_profile_failed&platform=soundcloud")
+
+    sid = create_session(
+        "soundcloud",
+        access_token=access_token,
+        refresh_token=refresh_token,
+        auth_source="oauth",
+        display_name=info["display_name"],
+        avatar=info.get("avatar", ""),
+    )
+    return redirect(f"/oauth-callback?sid={sid}&role={role}&display_name={urllib.parse.quote(info['display_name'])}&platform=soundcloud")
 
 
 @app.route("/api/config/amazon-music")
@@ -1810,14 +1959,31 @@ def connect_soundcloud():
     data = request.json or {}
     role = data.get("role", "src")
     access_token = (data.get("access_token") or os.getenv("SOUNDCLOUD_ACCESS_TOKEN", "")).strip()
+    cookie_header = (data.get("cookie_header") or "").strip()
+    client_id = (data.get("client_id") or "").strip()
 
     try:
+        if cookie_header and client_id:
+            info = soundcloud.validate_web_session(cookie_header, client_id)
+            sid = create_session(
+                "soundcloud",
+                access_token="",
+                soundcloud_cookie_header=cookie_header,
+                soundcloud_client_id=client_id,
+                auth_source="web_session",
+                display_name=info["display_name"],
+                avatar=info.get("avatar", ""),
+            )
+            return jsonify({"ok": True, "sid": sid, "display_name": info["display_name"]})
+
         if role == "src" and not access_token:
             sid = create_session("soundcloud", access_token="", display_name="SoundCloud (publico)", avatar="")
             return jsonify({"ok": True, "sid": sid, "display_name": "SoundCloud (publico)"})
 
         if role == "dest" and not access_token:
             raise ValueError("soundcloud_login_required")
+        if role == "dest" and access_token:
+            raise ValueError("soundcloud_web_session_required")
 
         info = soundcloud.validate(access_token or None)
         sid = create_session(
@@ -1831,8 +1997,8 @@ def connect_soundcloud():
         return jsonify({"ok": False, "error": str(e)})
 
 
-def _run_soundcloud_guided_capture(role: str):
-    import subprocess, sys, json as _json
+def _run_soundcloud_guided_capture_legacy(role: str):
+    import subprocess, sys, json as _json, queue as _queue
     attempt = soundcloud_browser_guided.setdefault(role, {})
     attempt.update({
         "status": "running",
@@ -1841,33 +2007,60 @@ def _run_soundcloud_guided_capture(role: str):
         "display_name": "",
         "avatar": "",
         "step": "opening_webview",
+        "started_at": time.time(),
         "updated_at": time.time(),
     })
 
     try:
         webview_script = os.path.join(os.path.dirname(__file__), "soundcloud_webview.py")
-        proc = subprocess.run(
-            [sys.executable, webview_script],
-            capture_output=True, text=True, timeout=180,
+        proc = subprocess.Popen(
+            [sys.executable, webview_script, role],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
-        output = (proc.stdout or "") + (proc.stderr or "")
 
-        access_token = ""
+        access_tokens = []
+        valid_access_tokens = []
+        token_context = {}
+        web_session_payload = {}
         aborted = False
+        timed_out = False
+        last_debug = {}
+        lines_queue = _queue.Queue()
 
-        for line in output.splitlines():
-            line = line.strip()
-            if line.startswith("SC_TOKEN_FOUND:"):
-                access_token = line.split("SC_TOKEN_FOUND:", 1)[1].strip()
-            elif "ABORTED" in line or "TIMEOUT" in line:
-                aborted = True
+        def add_candidate(value: str):
+            token = str(value or "").strip()
+            if token and token not in access_tokens:
+                access_tokens.append(token)
 
-        if access_token:
+        def finish_web_session() -> bool:
+            if not web_session_payload:
+                return False
             from services import soundcloud
-            info = soundcloud.validate(access_token)
+            cookie_header = str(web_session_payload.get("cookie_header") or "").strip()
+            client_id = str(web_session_payload.get("client_id") or "").strip()
+            app_version = str(web_session_payload.get("app_version") or "").strip()
+            browser_validated = bool(web_session_payload.get("validated_in_browser"))
+            try:
+                info = soundcloud.validate_web_session(cookie_header, client_id, app_version)
+            except Exception:
+                if not browser_validated:
+                    raise
+                info = {
+                    "display_name": str(web_session_payload.get("display_name") or "SoundCloud"),
+                    "avatar": str(web_session_payload.get("avatar") or ""),
+                }
             sid = create_session(
                 "soundcloud",
-                access_token=access_token,
+                access_token="",
+                soundcloud_access_token=(valid_access_tokens[-1] if valid_access_tokens else ""),
+                soundcloud_cookie_header=cookie_header,
+                soundcloud_client_id=client_id,
+                soundcloud_app_version=app_version,
+                soundcloud_browser_validated=browser_validated,
+                auth_source="web_session",
                 display_name=info["display_name"],
                 avatar=info.get("avatar", ""),
             )
@@ -1878,6 +2071,193 @@ def _run_soundcloud_guided_capture(role: str):
                 "display_name": info["display_name"],
                 "avatar": info.get("avatar", ""),
                 "step": "captured",
+                "updated_at": time.time(),
+            })
+            return True
+
+        def finish_access_token(access_token: str) -> bool:
+            from services import soundcloud
+            info = soundcloud.validate(access_token)
+            sid = create_session(
+                "soundcloud",
+                access_token=access_token,
+                soundcloud_access_token=access_token,
+                soundcloud_cookie_header=str(token_context.get("cookie_header") or "").strip(),
+                soundcloud_client_id=str(token_context.get("client_id") or "").strip(),
+                soundcloud_app_version=str(token_context.get("app_version") or "").strip(),
+                auth_source="oauth",
+                display_name=info["display_name"],
+                avatar=info.get("avatar", ""),
+            )
+            attempt.update({
+                "status": "done",
+                "error": "",
+                "sid": sid,
+                "display_name": info["display_name"],
+                "avatar": info.get("avatar", ""),
+                "step": "captured",
+                "updated_at": time.time(),
+            })
+            return True
+
+        def read_output():
+            try:
+                for output_line in proc.stdout or []:
+                    lines_queue.put(output_line)
+            finally:
+                lines_queue.put(None)
+
+        threading.Thread(target=read_output, daemon=True).start()
+
+        reader_finished = False
+        deadline = time.time() + (90 if role == "dest" else 240)
+        while True:
+            if time.time() > deadline:
+                timed_out = True
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+
+            try:
+                queued = lines_queue.get(timeout=0.5)
+            except _queue.Empty:
+                if proc.poll() is not None and reader_finished:
+                    break
+                continue
+
+            if queued is None:
+                reader_finished = True
+                if proc.poll() is not None:
+                    break
+                continue
+
+            line = str(queued or "").strip()
+            if not line:
+                continue
+
+            line = line.strip()
+            if line.startswith("SC_TOKEN_FOUND:"):
+                found_token = line.split("SC_TOKEN_FOUND:", 1)[1].strip()
+                add_candidate(found_token)
+                if found_token and found_token not in valid_access_tokens:
+                    valid_access_tokens.append(found_token)
+                try:
+                    if finish_access_token(found_token):
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        return
+                except Exception:
+                    pass
+            elif line.startswith("SC_TOKEN_CANDIDATE:"):
+                add_candidate(line.split("SC_TOKEN_CANDIDATE:", 1)[1].strip())
+            elif line.startswith("SC_TOKEN_CONTEXT:"):
+                try:
+                    token_context = _json.loads(line.split("SC_TOKEN_CONTEXT:", 1)[1].strip())
+                except Exception:
+                    token_context = {}
+            elif line.startswith("SC_SESSION_FOUND:"):
+                try:
+                    web_session_payload = _json.loads(line.split("SC_SESSION_FOUND:", 1)[1].strip())
+                    if finish_web_session():
+                        try:
+                            proc.terminate()
+                        except Exception:
+                            pass
+                        return
+                except Exception:
+                    web_session_payload = {}
+            elif line.startswith("SC_SESSION_DEBUG:"):
+                try:
+                    last_debug = _json.loads(line.split("SC_SESSION_DEBUG:", 1)[1].strip())
+                except Exception:
+                    last_debug = {}
+                attempt.update({
+                    "step": "checking_web_session",
+                    "updated_at": time.time(),
+                })
+                print(
+                    "[SoundCloud] login check: "
+                    f"client_id={bool(last_debug.get('has_client_id'))} "
+                    f"cookies={last_debug.get('cookies', 0)} "
+                    f"candidates={last_debug.get('candidates', 0)} "
+                    f"me={last_debug.get('me_status', 'unknown')} "
+                    f"browser_ok={bool(last_debug.get('browser_ok'))}",
+                    flush=True,
+                )
+            elif "ABORTED" in line or "TIMEOUT" in line:
+                aborted = True
+
+        if access_tokens and role != "dest":
+            last_validation_error = ""
+            for access_token in access_tokens:
+                try:
+                    finish_access_token(access_token)
+                    return
+                except Exception as exc:
+                    last_validation_error = str(exc)
+
+            try:
+                if finish_web_session():
+                    return
+            except Exception as exc:
+                last_validation_error = str(exc) or last_validation_error
+
+            attempt.update({
+                "status": "error",
+                "error": last_validation_error or "Nao consegui validar a sessao do SoundCloud depois do login.",
+                "step": "invalid_token",
+                "updated_at": time.time(),
+            })
+        elif access_tokens and role == "dest":
+            last_validation_error = ""
+            for access_token in access_tokens:
+                try:
+                    finish_access_token(access_token)
+                    return
+                except Exception as exc:
+                    last_validation_error = str(exc)
+
+            try:
+                if finish_web_session():
+                    return
+            except Exception as exc:
+                attempt.update({
+                    "status": "error",
+                    "error": str(exc) or last_validation_error or "A sessao do SoundCloud abriu, mas ainda nao liberou escrita de playlists.",
+                    "step": "invalid_web_session",
+                    "updated_at": time.time(),
+                })
+        elif web_session_payload:
+            try:
+                if finish_web_session():
+                    return
+            except Exception as exc:
+                attempt.update({
+                    "status": "error",
+                    "error": str(exc) or "Nao consegui validar a sessao web do SoundCloud depois do login.",
+                    "step": "invalid_web_session",
+                    "updated_at": time.time(),
+                })
+        elif timed_out:
+            suffix = ""
+            if last_debug:
+                suffix = (
+                    f" Diagnostico: client_id={'sim' if last_debug.get('has_client_id') else 'nao'}, "
+                    f"cookies={last_debug.get('cookies', 0)}, "
+                    f"validacao={last_debug.get('me_status', 'desconhecida')}."
+                )
+            attempt.update({
+                "status": "error",
+                "error": (
+                    "Tempo esgotado aguardando a sessao web do SoundCloud. "
+                    "A janela abriu, mas o SoundCloud nao liberou permissao de playlist para esta sessao."
+                    + suffix
+                ),
+                "step": "timed_out",
                 "updated_at": time.time(),
             })
         elif aborted:
@@ -1898,7 +2278,7 @@ def _run_soundcloud_guided_capture(role: str):
     except subprocess.TimeoutExpired:
         attempt.update({
             "status": "error",
-            "error": "Tempo esgotado aguardando login no SoundCloud. Tente novamente.",
+            "error": "Tempo esgotado aguardando a confirmacao do SoundCloud. Feche a janela de login e tente novamente.",
             "step": "timed_out",
             "updated_at": time.time(),
         })
@@ -1911,6 +2291,10 @@ def _run_soundcloud_guided_capture(role: str):
         })
 
 
+
+
+def _run_soundcloud_guided_capture(role: str):
+    _run_soundcloud_guided_capture_legacy(role)
 
 
 @app.route("/api/capture/soundcloud-session", methods=["POST"])
@@ -1928,6 +2312,7 @@ def start_soundcloud_session_capture():
         "display_name": "",
         "avatar": "",
         "step": "queued",
+        "started_at": time.time(),
         "updated_at": time.time(),
     }
     threading.Thread(target=_run_soundcloud_guided_capture, args=(role,), daemon=True).start()
@@ -1944,8 +2329,22 @@ def soundcloud_session_capture_status():
         "display_name": "",
         "avatar": "",
         "step": "idle",
+        "started_at": 0,
         "updated_at": 0,
     }
+    if data.get("status") == "running":
+        started_at = float(data.get("started_at") or data.get("updated_at") or 0)
+        max_age = 105 if role == "dest" else 260
+        if started_at and time.time() - started_at > max_age:
+            data.update({
+                "status": "error",
+                "error": (
+                    "Tempo esgotado aguardando a sessao web do SoundCloud. "
+                    "A janela abriu, mas o SoundCloud nao liberou permissao de playlist para esta sessao."
+                ),
+                "step": "timed_out",
+                "updated_at": time.time(),
+            })
     return jsonify({
         "ok": True,
         "connected": bool(data.get("sid")),
@@ -1955,6 +2354,7 @@ def soundcloud_session_capture_status():
         "display_name": data.get("display_name", ""),
         "avatar": data.get("avatar", ""),
         "step": data.get("step", "idle"),
+        "started_at": data.get("started_at", 0),
         "updated_at": data.get("updated_at", 0),
     })
 
@@ -2161,6 +2561,8 @@ def api_platforms():
     p["spotify"]["oauth_redirect_uri"] = build_callback_url("spotify")
     p["deezer"]["oauth_configured"]  = bool(DEEZER_APP_ID and DEEZER_SECRET_KEY)
     p["soundcloud"]["auto_configured"] = True
+    p["soundcloud"]["oauth_configured"] = bool(SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET)
+    p["soundcloud"]["oauth_redirect_uri"] = build_callback_url("soundcloud")
     p["soundcloud"]["saved_token_configured"] = bool(os.getenv("SOUNDCLOUD_ACCESS_TOKEN", "").strip())
     apple_ready = False
     try:
@@ -2344,9 +2746,12 @@ def run_transfer(job: dict, data: dict):
 
             access_token = dest_sess.get("access_token")
             refresh_token = dest_sess.get("refresh_token", "")
-            sp_dc = dest_sess.get("sp_dc")
-            cookie_header = dest_sess.get("spotify_cookie_header", "")
-            client_token = dest_sess.get("spotify_client_token", "")
+            granted_scopes = str(dest_sess.get("scopes") or "").strip()
+            if granted_scopes and not spotify_has_destination_scopes(granted_scopes):
+                raise ValueError("spotify_oauth_missing_playlist_scope")
+            sp_dc = ""
+            cookie_header = ""
+            client_token = ""
             if not access_token and (sp_dc or cookie_header):
                 access_token = spotify.get_token_via_sp_dc(sp_dc=sp_dc, cookie_header=cookie_header)
             if not access_token:
@@ -2375,7 +2780,7 @@ def run_transfer(job: dict, data: dict):
                         print(f"[Spotify] OAuth refresh falhou: {exc}")
 
                 # Attempt 2: sp_dc cookie (works for webview/manual connections)
-                if sp_dc or cookie_header:
+                if not is_official_spotify_login and (sp_dc or cookie_header):
                     try:
                         fresh_token = spotify.get_token_via_sp_dc(sp_dc=sp_dc, cookie_header=cookie_header)
                     except Exception as exc:
@@ -2392,7 +2797,7 @@ def run_transfer(job: dict, data: dict):
                 return False
 
             # Pre-refresh the token to start with a fresh one
-            if sp_dc or cookie_header or (refresh_token and SPOTIFY_CLIENT_ID):
+            if refresh_token and SPOTIFY_CLIENT_ID:
                 refresh_spotify_token()
 
             def spotify_with_visible_wait(
@@ -2487,6 +2892,19 @@ def run_transfer(job: dict, data: dict):
                         "Tente novamente em alguns minutos."
                     ) from exc
                 raise
+            except spotify.SpotifyForbiddenError as exc:
+                if refresh_token and refresh_spotify_token():
+                    emit(job, {"type": "status", "msg": "Sessao do Spotify renovada. Criando playlist novamente..."})
+                    try:
+                        playlist_id = spotify.create_playlist(
+                            access_token,
+                            nome,
+                            "Transferida via PlayTransfer",
+                        )
+                    except spotify.SpotifyForbiddenError as retry_exc:
+                        raise ValueError("spotify_oauth_reconnect_required_after_403") from retry_exc
+                else:
+                    raise ValueError("spotify_oauth_reconnect_required_after_403") from exc
             emit(job, {"type": "status", "msg": "Buscando músicas no Spotify..."})
 
             for i, m in enumerate(musicas):
@@ -2513,18 +2931,24 @@ def run_transfer(job: dict, data: dict):
 
             if ids_encontrados:
                 emit(job, {"type": "status", "msg": "Adicionando faixas..."})
-                spotify_with_visible_wait(
-                    "adicionar as musicas",
-                    lambda: spotify.add_tracks(
-                        access_token,
-                        playlist_id,
-                        ids_encontrados,
-                        client_token=client_token,
-                    ),
-                    attempts=8,
-                    max_wait_seconds=90,
-                    max_total_wait_seconds=420,
-                )
+                try:
+                    spotify_with_visible_wait(
+                        "adicionar as musicas",
+                        lambda: spotify.add_tracks(
+                            access_token,
+                            playlist_id,
+                            ids_encontrados,
+                        ),
+                        attempts=8,
+                        max_wait_seconds=90,
+                        max_total_wait_seconds=420,
+                    )
+                except spotify.SpotifyForbiddenError as exc:
+                    if refresh_token and refresh_spotify_token():
+                        emit(job, {"type": "status", "msg": "Sessao do Spotify renovada. Adicionando faixas novamente..."})
+                        spotify.add_tracks(access_token, playlist_id, ids_encontrados)
+                    else:
+                        raise ValueError("spotify_oauth_reconnect_required_after_403") from exc
 
             dest_url = f"https://open.spotify.com/playlist/{playlist_id}"
 
@@ -2533,16 +2957,49 @@ def run_transfer(job: dict, data: dict):
 
             dest_sess = sessions.get(dest_sid, {})
             access_token = dest_sess.get("access_token", "")
-            if not access_token:
-                raise ValueError("Sessão do SoundCloud não encontrada. Reconecte o SoundCloud e tente novamente.")
+            sc_access_token = dest_sess.get("soundcloud_access_token", "") or access_token
+            sc_cookie_header = dest_sess.get("soundcloud_cookie_header", "")
+            sc_client_id = dest_sess.get("soundcloud_client_id", "")
+            sc_app_version = dest_sess.get("soundcloud_app_version", "")
+            use_official_oauth = dest_sess.get("auth_source") == "oauth" and bool(access_token)
+            use_web_session = bool(sc_cookie_header and sc_client_id)
+            # Prefer web-session flow when both are available.
+            # SoundCloud often returns 403 on server-side OAuth playlist creation,
+            # while the browser-backed session path remains stable.
+            if use_web_session:
+                use_official_oauth = False
+            if not use_official_oauth and not use_web_session:
+                raise ValueError("soundcloud_oauth_required_for_destination")
 
-            created = soundcloud.create_playlist(access_token, nome, "Transferida via PlayTransfer")
-            playlist_id = created["id"]
-            dest_url = created["url"]
+            if use_official_oauth:
+                created = soundcloud.create_playlist(
+                    access_token,
+                    nome,
+                    "Transferida via PlayTransfer",
+                    client_id=sc_client_id,
+                    app_version=sc_app_version,
+                    cookie_header=sc_cookie_header,
+                )
+                playlist_id = created["id"]
+                dest_url = created["url"]
+            else:
+                playlist_id = ""
+                dest_url = "https://soundcloud.com/you/library"
             emit(job, {"type": "status", "msg": "Buscando músicas no SoundCloud..."})
 
             for i, m in enumerate(musicas):
-                track_id = soundcloud.search_track(access_token, m["titulo"], m["artista"], m.get("album", ""))
+                if use_official_oauth:
+                    track_id = soundcloud.search_track(access_token, m["titulo"], m["artista"], m.get("album", ""))
+                else:
+                    track_id = soundcloud.search_track_web_session(
+                        sc_cookie_header,
+                        sc_client_id,
+                        m["titulo"],
+                        m["artista"],
+                        m.get("album", ""),
+                    )
+                    if not track_id:
+                        track_id = soundcloud.search_track("", m["titulo"], m["artista"], m.get("album", ""))
                 if track_id:
                     ids_encontrados.append(track_id)
                 else:
@@ -2551,7 +3008,45 @@ def run_transfer(job: dict, data: dict):
                            "found": bool(track_id), "current": i + 1, "total": len(musicas)})
                 time.sleep(0.10)
 
-            if ids_encontrados:
+            if use_web_session:
+                emit(job, {"type": "status", "msg": "Criando playlist no SoundCloud..."})
+                webview_error = None
+                try:
+                    created = soundcloud.create_playlist_with_tracks_webview(
+                        nome,
+                        "Transferida via PlayTransfer",
+                        ids_encontrados,
+                        access_token=sc_access_token,
+                        cookie_header=sc_cookie_header,
+                        client_id=sc_client_id,
+                        app_version=sc_app_version,
+                    )
+                    playlist_id = created["id"]
+                    dest_url = created["url"]
+                except Exception as exc:
+                    webview_error = str(exc)
+                    emit(job, {"type": "status", "msg": "Sessao da janela recusou. Tentando modo alternativo do SoundCloud..."})
+                    created = soundcloud.create_playlist_web_session(
+                        sc_cookie_header,
+                        sc_client_id,
+                        nome,
+                        "Transferida via PlayTransfer",
+                        app_version=sc_app_version,
+                    )
+                    playlist_id = created["id"]
+                    dest_url = created["url"]
+                    if ids_encontrados:
+                        soundcloud.add_tracks_web_session(
+                            sc_cookie_header,
+                            sc_client_id,
+                            playlist_id,
+                            ids_encontrados,
+                            app_version=sc_app_version,
+                        )
+                    if webview_error:
+                        print(f"[SoundCloud] fallback web-session after webview failure: {webview_error}", flush=True)
+
+            if ids_encontrados and use_official_oauth:
                 emit(job, {"type": "status", "msg": "Adicionando faixas..."})
                 soundcloud.add_tracks(access_token, playlist_id, ids_encontrados)
 
@@ -2719,11 +3214,14 @@ def health():
     return jsonify({"status": "ok", "version": "1.2.26", "app": "PlayTransfer"})
 
 if __name__ == "__main__":
-    import webbrowser
     port = int(os.getenv("PORT", 5001))
-    def _open():
-        time.sleep(1.2)
-        webbrowser.open(f"http://localhost:{port}")
-    threading.Thread(target=_open, daemon=True).start()
+    if os.getenv("PLAYTRANSFER_OPEN_BROWSER", "").strip() == "1":
+        import webbrowser
+
+        def _open():
+            time.sleep(1.2)
+            webbrowser.open(f"http://localhost:{port}")
+
+        threading.Thread(target=_open, daemon=True).start()
     print(f"\nPlayTransfer rodando em http://localhost:{port}\n")
     app.run(debug=False, port=port, threaded=True)
