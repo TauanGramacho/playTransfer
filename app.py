@@ -13,12 +13,46 @@ app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET", "playtransfer_dev_secret_" + secrets.token_hex(8))
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
+PLAYTRANSFER_ENV = str(os.getenv("PLAYTRANSFER_ENV", "") or os.getenv("FLASK_ENV", "")).strip().lower()
+IS_PRODUCTION = PLAYTRANSFER_ENV in {"prod", "production"}
+ADMIN_API_TOKEN = str(os.getenv("PLAYTRANSFER_ADMIN_TOKEN", "")).strip()
+ALLOW_PUBLIC_CONFIG_IN_PROD = str(os.getenv("PLAYTRANSFER_ALLOW_PUBLIC_CONFIG", "")).strip() == "1"
+ENABLE_DEBUG_ROUTES_IN_PROD = str(os.getenv("PLAYTRANSFER_ENABLE_DEBUG_ROUTES", "")).strip() == "1"
+
 @app.after_request
 def no_cache(r):
     r.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
     r.headers["Pragma"] = "no-cache"
     r.headers["Expires"] = "0"
     return r
+
+
+def _is_loopback_request() -> bool:
+    remote = str(request.remote_addr or "").strip().lower()
+    host = str(request.host or "").strip().lower()
+    host_name = host.split(":", 1)[0]
+    return remote in {"127.0.0.1", "::1"} and host_name in {"127.0.0.1", "localhost", "::1"}
+
+
+def _has_admin_token() -> bool:
+    if not ADMIN_API_TOKEN:
+        return False
+    token = (
+        str(request.headers.get("X-Admin-Token", "")).strip()
+        or str(request.args.get("admin_token", "")).strip()
+        or str((request.json or {}).get("admin_token", "")).strip() if request.is_json else ""
+    )
+    return bool(token) and secrets.compare_digest(token, ADMIN_API_TOKEN)
+
+
+def _require_sensitive_access(*, allow_public_in_prod: bool = False) -> tuple[bool, tuple[dict, int] | None]:
+    if not IS_PRODUCTION:
+        return True, None
+    if allow_public_in_prod:
+        return True, None
+    if _is_loopback_request() or _has_admin_token():
+        return True, None
+    return False, ({"ok": False, "error": "forbidden_sensitive_route"}, 403)
 
 # ── Estado em memória ─────────────────────────────────────────────────────────
 jobs: dict[str, dict] = {}
@@ -380,6 +414,11 @@ def get_apple_music_developer_token(force_refresh: bool = False) -> tuple[str, s
 
 @app.route("/api/config/spotify-oauth", methods=["POST"])
 def configure_spotify_oauth():
+    allowed, error = _require_sensitive_access(allow_public_in_prod=ALLOW_PUBLIC_CONFIG_IN_PROD)
+    if not allowed:
+        payload, status = error
+        return jsonify(payload), status
+
     global SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, BASE_URL
 
     data = request.json or {}
@@ -422,6 +461,11 @@ def configure_spotify_oauth():
 
 @app.route("/api/config/soundcloud-oauth", methods=["POST"])
 def configure_soundcloud_oauth():
+    allowed, error = _require_sensitive_access(allow_public_in_prod=ALLOW_PUBLIC_CONFIG_IN_PROD)
+    if not allowed:
+        payload, status = error
+        return jsonify(payload), status
+
     global SOUNDCLOUD_CLIENT_ID, SOUNDCLOUD_CLIENT_SECRET, BASE_URL
 
     data = request.json or {}
@@ -800,6 +844,11 @@ def amazon_music_config():
 
 @app.route("/api/config/amazon-music", methods=["POST"])
 def configure_amazon_music():
+    allowed, error = _require_sensitive_access(allow_public_in_prod=ALLOW_PUBLIC_CONFIG_IN_PROD)
+    if not allowed:
+        payload, status = error
+        return jsonify(payload), status
+
     global AMAZON_MUSIC_API_KEY, AMAZON_LWA_CLIENT_ID, AMAZON_LWA_CLIENT_SECRET
     global AMAZON_MUSIC_COUNTRY_CODE, AMAZON_MUSIC_SCOPES, BASE_URL
 
@@ -986,6 +1035,11 @@ def disconnect_amazon_session():
 
 @app.route("/api/debug/amazon-api-calls")
 def debug_amazon_api_calls():
+    allowed, error = _require_sensitive_access(allow_public_in_prod=ENABLE_DEBUG_ROUTES_IN_PROD)
+    if not allowed:
+        payload, status = error
+        return jsonify(payload), status
+
     """Retorna as chamadas de API interceptadas pelo webview do Amazon Music."""
     cookies = amazon_connections.get("dest", {})
     api_calls = cookies.get("_api_calls", [])
@@ -1001,6 +1055,11 @@ def debug_amazon_api_calls():
 
 @app.route("/api/debug/amazon-test")
 def debug_amazon_test():
+    allowed, error = _require_sensitive_access(allow_public_in_prod=ENABLE_DEBUG_ROUTES_IN_PROD)
+    if not allowed:
+        payload, status = error
+        return jsonify(payload), status
+
     import requests as _req
     cookies = amazon_connections.get("dest", {})
     if not cookies:
@@ -2407,6 +2466,11 @@ def connect_apple():
 
 @app.route("/api/config/apple-music")
 def apple_music_config():
+    allowed, error = _require_sensitive_access(allow_public_in_prod=ALLOW_PUBLIC_CONFIG_IN_PROD)
+    if not allowed:
+        payload, status = error
+        return jsonify(payload), status
+
     developer_token = ""
     bootstrap_source = ""
     try:
@@ -2426,6 +2490,11 @@ def apple_music_config():
 
 @app.route("/api/config/apple-music", methods=["POST"])
 def configure_apple_music():
+    allowed, error = _require_sensitive_access(allow_public_in_prod=ALLOW_PUBLIC_CONFIG_IN_PROD)
+    if not allowed:
+        payload, status = error
+        return jsonify(payload), status
+
     data = request.json or {}
     developer_token = str(data.get("developer_token") or "").strip()
     storefront = str(data.get("storefront") or "us").strip().lower() or "us"
