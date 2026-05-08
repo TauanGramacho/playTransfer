@@ -1,0 +1,9 @@
+.venv
+.git
+__pycache__
+*.pyc
+.env
+.DS_Store
+.runtime
+build
+.tmp_soundcloud_js

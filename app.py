@@ -14,10 +14,25 @@ app.secret_key = os.getenv("FLASK_SECRET", "playtransfer_dev_secret_" + secrets.
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
 PLAYTRANSFER_ENV = str(os.getenv("PLAYTRANSFER_ENV", "") or os.getenv("FLASK_ENV", "")).strip().lower()
-IS_PRODUCTION = PLAYTRANSFER_ENV in {"prod", "production"}
+IS_CLOUD = bool(
+    os.getenv("FLY_APP_NAME")           # Fly.io sets this automatically
+    or os.getenv("PLAYTRANSFER_CLOUD", "").strip() == "1"
+    or os.getenv("DYNO")                # Heroku
+    or os.getenv("RENDER")              # Render
+)
+IS_PRODUCTION = PLAYTRANSFER_ENV in {"prod", "production"} or IS_CLOUD
 ADMIN_API_TOKEN = str(os.getenv("PLAYTRANSFER_ADMIN_TOKEN", "")).strip()
 ALLOW_PUBLIC_CONFIG_IN_PROD = str(os.getenv("PLAYTRANSFER_ALLOW_PUBLIC_CONFIG", "")).strip() == "1"
 ENABLE_DEBUG_ROUTES_IN_PROD = str(os.getenv("PLAYTRANSFER_ENABLE_DEBUG_ROUTES", "")).strip() == "1"
+
+
+def _native_automation_error(platform: str = "") -> str:
+    suffix = f" ({platform})" if platform else ""
+    return f"native_automation_unavailable_in_cloud{suffix}"
+
+
+def _native_automation_allowed() -> bool:
+    return not IS_CLOUD or os.getenv("PLAYTRANSFER_ENABLE_NATIVE_AUTOMATION", "").strip() == "1"
 
 @app.after_request
 def no_cache(r):
@@ -923,6 +938,16 @@ def _has_amazon_session_cookie(cookies: dict) -> bool:
 @app.route("/api/capture/amazon-session", methods=["POST"])
 def start_amazon_session_capture():
     global amazon_session_attempt
+    if not _native_automation_allowed():
+        amazon_session_attempt = {
+            "status": "error",
+            "step": "disabled_cloud",
+            "role": (request.json or {}).get("role", "dest"),
+            "display_name": "",
+            "error": _native_automation_error("amazon"),
+            "updated_at": time.time(),
+        }
+        return jsonify({"ok": False, "error": _native_automation_error("amazon")})
     if amazon_session_attempt.get("status") == "running":
         return jsonify({"ok": True, "already_running": True})
 
@@ -1341,6 +1366,8 @@ def connect_spotify_manual():
 @app.route("/api/connect/spotify/browser-cookie", methods=["POST"])
 def connect_spotify_browser_cookie():
     from services import spotify
+    if not _native_automation_allowed():
+        return jsonify({"ok": False, "error": _native_automation_error("spotify")})
 
     try:
         found = spotify.read_saved_spotify_cookie()
@@ -1475,6 +1502,18 @@ def _run_spotify_guided_capture(role: str):
 def connect_spotify_browser_guided_start():
     data = request.json or {}
     role = str(data.get("role") or "dest").strip() or "dest"
+    if not _native_automation_allowed():
+        spotify_browser_guided[role] = {
+            "status": "error",
+            "error": _native_automation_error("spotify"),
+            "access_token": "",
+            "client_token": "",
+            "sp_dc": "",
+            "cookie_header": "",
+            "step": "disabled_cloud",
+            "updated_at": time.time(),
+        }
+        return jsonify({"ok": False, "error": _native_automation_error("spotify")})
 
     if role == "dest" and not SPOTIFY_CLIENT_ID:
         spotify_browser_guided[role] = {
@@ -1560,6 +1599,8 @@ def connect_deezer_manual():
 @app.route("/api/connect/deezer/browser-cookie", methods=["POST"])
 def connect_deezer_browser_cookie():
     from services import deezer
+    if not _native_automation_allowed():
+        return jsonify({"ok": False, "error": _native_automation_error("deezer")})
 
     try:
         found = deezer.read_saved_arl()
@@ -1660,6 +1701,15 @@ def _run_deezer_chrome_guided_capture(role: str):
 def connect_deezer_browser_guided_start():
     data = request.json or {}
     role = str(data.get("role") or "dest").strip() or "dest"
+    if not _native_automation_allowed():
+        deezer_browser_guided[role] = {
+            "status": "error",
+            "error": _native_automation_error("deezer"),
+            "arl": "",
+            "step": "disabled_cloud",
+            "updated_at": time.time(),
+        }
+        return jsonify({"ok": False, "error": _native_automation_error("deezer")})
     deezer_browser_guided[role] = {
         "status": "pending",
         "error": "",
@@ -1957,6 +2007,8 @@ def connect_youtube_auto_finish():
 @app.route("/api/connect/youtube/guided/start", methods=["POST"])
 def connect_youtube_guided_start():
     from services import youtube_music
+    if not _native_automation_allowed():
+        return jsonify({"ok": False, "error": _native_automation_error("youtube")})
 
     try:
         login = youtube_music.start_guided_login()
@@ -2360,6 +2412,18 @@ def _run_soundcloud_guided_capture(role: str):
 def start_soundcloud_session_capture():
     data = request.json or {}
     role = str(data.get("role") or "dest").strip() or "dest"
+    if not _native_automation_allowed():
+        soundcloud_browser_guided[role] = {
+            "status": "error",
+            "error": _native_automation_error("soundcloud"),
+            "sid": "",
+            "display_name": "",
+            "avatar": "",
+            "step": "disabled_cloud",
+            "started_at": time.time(),
+            "updated_at": time.time(),
+        }
+        return jsonify({"ok": False, "error": _native_automation_error("soundcloud")})
     current = soundcloud_browser_guided.get(role) or {}
     if current.get("status") == "running" and time.time() - float(current.get("updated_at") or 0) < 180:
         return jsonify({"ok": True, "already_running": True})
@@ -2466,7 +2530,8 @@ def connect_apple():
 
 @app.route("/api/config/apple-music")
 def apple_music_config():
-    allowed, error = _require_sensitive_access(allow_public_in_prod=ALLOW_PUBLIC_CONFIG_IN_PROD)
+    # Developer token is public (scraped from Apple web), safe to expose.
+    allowed, error = _require_sensitive_access(allow_public_in_prod=True)
     if not allowed:
         payload, status = error
         return jsonify(payload), status
@@ -2625,11 +2690,19 @@ def connect_tidal_poll(login_id):
 def api_platforms():
     # Indica se OAuth está configurado
     p = {key: {**value} for key, value in PLATFORMS.items()}
+    native_automation_available = _native_automation_allowed()
+    p["_meta"] = {
+        "is_cloud": IS_CLOUD,
+        "native_automation_available": native_automation_available,
+    }
+    for platform_data in p.values():
+        if isinstance(platform_data, dict):
+            platform_data["native_automation_available"] = native_automation_available
     p["spotify"]["oauth_configured"] = bool(SPOTIFY_CLIENT_ID)
     p["spotify"]["oauth_mode"] = "pkce" if (SPOTIFY_CLIENT_ID and not SPOTIFY_CLIENT_SECRET) else "server"
     p["spotify"]["oauth_redirect_uri"] = build_callback_url("spotify")
     p["deezer"]["oauth_configured"]  = bool(DEEZER_APP_ID and DEEZER_SECRET_KEY)
-    p["soundcloud"]["auto_configured"] = True
+    p["soundcloud"]["auto_configured"] = native_automation_available
     p["soundcloud"]["oauth_configured"] = bool(SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET)
     p["soundcloud"]["oauth_redirect_uri"] = build_callback_url("soundcloud")
     p["soundcloud"]["saved_token_configured"] = bool(os.getenv("SOUNDCLOUD_ACCESS_TOKEN", "").strip())

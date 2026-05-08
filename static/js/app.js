@@ -52,7 +52,12 @@ async function loadPlatforms() {
   try {
     const r = await fetch('/api/platforms');
     state.platforms = await r.json();
+    state.isCloud = !!(state.platforms._meta?.is_cloud);
   } catch (e) { console.error('Failed to load platforms', e); }
+}
+
+function nativeAutomationAvailable(platform) {
+  return !state.isCloud && state.platforms[platform]?.native_automation_available !== false;
 }
 
 // ── OAuth message listener (popup → parent) ─────────────────
@@ -707,6 +712,19 @@ function autoConnectSoundcloud(role) {
   const btn = document.getElementById(`${role}-soundcloud-auto-btn`);
   state.soundcloudCapturePolls = state.soundcloudCapturePolls || {};
 
+  // ── Cloud mode: webview não existe, usar OAuth ou orientar ──
+  if (state.isCloud) {
+    if (state.platforms.soundcloud?.oauth_configured) {
+      if (status) status.innerHTML = '<span class="spin-inline"></span> Abrindo o login oficial do SoundCloud...';
+      openOAuthPopup('soundcloud', role);
+      return;
+    }
+    if (status) {
+      status.textContent = 'Na versao online, o SoundCloud precisa do OAuth oficial configurado. Use o modo manual abaixo para configurar.';
+    }
+    return;
+  }
+
   if (state.soundcloudCapturePolls[role]) {
     clearTimeout(state.soundcloudCapturePolls[role]);
     state.soundcloudCapturePolls[role] = null;
@@ -1024,6 +1042,19 @@ function autoConnectAmazon(role) {
   // Igual ao Deezer: abre o webview de login e captura cookies de sessão
   const status = document.getElementById(`${role}-amazon-status`);
   const btn    = document.getElementById(`${role}-amazon-auto-btn`);
+
+  // ── Cloud mode: webview não existe ──
+  if (state.isCloud) {
+    if (state.platforms.amazon?.oauth_configured) {
+      if (status) status.innerHTML = '<span class="spin-inline"></span> Abrindo o login oficial da Amazon...';
+      openOAuthPopup('amazon', role);
+      return;
+    }
+    if (status) status.textContent = 'Na versao online, o Amazon Music precisa do OAuth oficial configurado. A conexao automatica via janela de login nao esta disponivel no servidor.';
+    openAmazonOAuthSetupModal(role);
+    if (btn) { btn.disabled = false; btn.innerHTML = '🔌 Conectar Amazon Music'; }
+    return;
+  }
 
   if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spin-inline"></span> Abrindo login da Amazon...'; }
   if (status) status.innerHTML = '<span class="spin-inline"></span> Aguardando login na janela Amazon Music...';
@@ -1536,15 +1567,69 @@ function makeDeezerForm(role) {
   if (state.platforms.deezer?.oauth_configured) {
     wrapper.appendChild(makeOAuthForm('deezer', role));
     wrapper.appendChild(makeAdvancedDetails(
-      'Usar modo automatico do Deezer',
-      makeDeezerQuickConnect(role)
+      state.isCloud ? 'Nao funcionou? Fazer manualmente' : 'Usar modo automatico do Deezer',
+      state.isCloud ? makeDeezerCloudManualForm(role) : makeDeezerQuickConnect(role),
+      false
     ));
     return wrapper;
   }
 
-  // Sem OAuth: fluxo automatico é o principal
+  // Cloud sem OAuth: mostra direto o formulário manual amigável
+  if (state.isCloud) {
+    wrapper.appendChild(makeDeezerCloudManualForm(role));
+    return wrapper;
+  }
+
+  // Desktop sem OAuth: fluxo automatico é o principal
   wrapper.appendChild(makeDeezerQuickConnect(role));
   return wrapper;
+}
+
+function makeDeezerCloudManualForm(role) {
+  const connected = (role === 'src' && state.srcSid) || (role === 'dest' && state.destSid);
+  const displayName = role === 'src' ? state.srcDisplayName : state.destDisplayName;
+
+  if (connected && displayName) {
+    return makeConnectCallout({
+      platform: 'deezer',
+      tone: 'success',
+      badge: 'Conectado',
+      title: `Deezer conectado como ${displayName}`,
+      subtitle: 'Pronto para transferir playlists.',
+    });
+  }
+
+  return makeFormPanel(`
+    <div class="manual-connect-header deezer-quick-header">
+      <div class="manual-connect-platform">
+        <div class="manual-connect-platform-icon">${PLATFORM_ICONS.deezer || ''}</div>
+        <div class="manual-connect-platform-copy">
+          <div class="manual-connect-title">Conectar Deezer</div>
+          <div class="manual-connect-subtitle">Para conectar sua conta do Deezer, cole o cookie <strong>arl</strong> abaixo.</div>
+        </div>
+      </div>
+    </div>
+    <div class="form-group" style="margin-top:0;">
+      <label class="form-label" for="${role}-deezer-cookie">Cookie arl do Deezer</label>
+      <textarea id="${role}-deezer-cookie" class="form-input form-textarea" placeholder="Cole o valor do cookie arl aqui"></textarea>
+    </div>
+    <div class="manual-connect-actions deezer-quick-actions">
+      <button class="btn btn-primary btn-sm" type="button" onclick="connectDeezer('${role}')">Conectar Deezer</button>
+    </div>
+    ${makeInlineStatus(`${role}-deezer-status`)}
+    <details class="advanced-details compact-manual-details" style="margin-top:8px;">
+      <summary>Como pegar o cookie arl?</summary>
+      <div class="advanced-details-body">
+        <ol style="padding-left:18px;margin:8px 0;line-height:1.7;">
+          <li>Abra <a href="https://www.deezer.com" target="_blank" rel="noopener">deezer.com</a> e entre na sua conta.</li>
+          <li>Pressione <kbd>F12</kbd> para abrir as ferramentas do navegador.</li>
+          <li>Clique em <strong>Application</strong> (ou <strong>Armazenamento</strong>) &gt; <strong>Cookies</strong> &gt; <code>https://www.deezer.com</code>.</li>
+          <li>Encontre o cookie chamado <code>arl</code> e copie o <strong>valor</strong> dele.</li>
+          <li>Cole acima e clique em <strong>Conectar Deezer</strong>.</li>
+        </ol>
+      </div>
+    </details>
+  `);
 }
 
 function makeDeezerQuickConnect(role) {
@@ -1656,14 +1741,19 @@ function makeYoutubeQuickConnect(role) {
   const pending = state.youtubePending?.[role];
   const autoTrying = !!pending || !!state.youtubeAutoConnecting?.[role];
   const oauthConfigured = !!state.platforms.youtube?.oauth_configured;
+  const canUseNative = nativeAutomationAvailable('youtube');
 
   let subtitle = oauthConfigured
     ? 'Clique no botao abaixo. O app abre o login oficial do Google e tenta concluir sozinho.'
-    : 'Clique no botao abaixo. O app tenta usar o que ja tiver disponivel e, se precisar, abre uma janela guiada para concluir o login.';
+    : canUseNative
+      ? 'Clique no botao abaixo. O app tenta usar o que ja tiver disponivel e, se precisar, abre uma janela guiada para concluir o login.'
+      : 'Use o modo manual abaixo para conectar o YouTube Music nesta versao online.';
 
   let hint = oauthConfigured
     ? 'Depois da autorizacao no Google, esta tela continua sozinha.'
-    : 'Se voce ja tiver algo valido copiado do navegador, o app aproveita. Se nao, ele abre uma janela guiada do YouTube Music e tenta terminar tudo sozinho.';
+    : canUseNative
+      ? 'Se voce ja tiver algo valido copiado do navegador, o app aproveita. Se nao, ele abre uma janela guiada do YouTube Music e tenta terminar tudo sozinho.'
+      : 'Copie o cURL da requisicao browse no seu navegador e cole no painel manual.';
 
   if (pending?.mode === 'oauth') {
     hint = pending.userCode
@@ -1706,28 +1796,58 @@ function makeYoutubeForm(role) {
   }
 
   const wrapper = document.createElement('div');
+  const oauthConfigured = !!state.platforms.youtube?.oauth_configured;
+  const canUseNative = nativeAutomationAvailable('youtube');
   const manualDetails = makeAdvancedDetails(
-    'Nao funcionou? Fazer manualmente',
+    oauthConfigured || canUseNative ? 'Nao funcionou? Fazer manualmente' : 'Conectar manualmente',
     makeYoutubeManualPanel(
       role,
-      state.platforms.youtube?.oauth_configured
+      oauthConfigured
         ? 'Use isso so se o automatico nao abrir ou nao terminar.'
-        : 'Use isso so se a janela guiada nao der certo nesta instalacao.',
-      state.platforms.youtube?.oauth_configured
+        : canUseNative
+          ? 'Use isso so se a janela guiada nao der certo nesta instalacao.'
+          : 'Nesta versao online, este e o caminho disponivel enquanto o OAuth oficial do YouTube Music nao estiver configurado.',
+      oauthConfigured
         ? 'Se o automatico funcionar, voce pode ignorar esta parte.'
         : 'Quando o login oficial do Google for ativado nesta instalacao, este passo manual deixa de ser o caminho principal.'
     ),
-    false
+    !oauthConfigured && !canUseNative
   );
   manualDetails.id = `${role}-youtube-manual-details`;
 
-  wrapper.appendChild(makeYoutubeQuickConnect(role));
+  if (oauthConfigured || canUseNative) {
+    wrapper.appendChild(makeYoutubeQuickConnect(role));
+  }
   wrapper.appendChild(manualDetails);
   return wrapper;
 }
 
 function makeSoundcloudForm(role) {
   const wrapper = document.createElement('div');
+  const oauthConfigured = !!state.platforms.soundcloud?.oauth_configured;
+  const canUseNative = nativeAutomationAvailable('soundcloud') && state.platforms.soundcloud?.auto_configured !== false;
+
+  if (oauthConfigured) {
+    wrapper.appendChild(makeAutomaticConnectPanel({
+      platform: 'soundcloud',
+      role,
+      title: 'Conectar SoundCloud',
+      subtitle: role === 'src'
+        ? 'Para playlists publicas, voce pode continuar sem login. Se precisar entrar, use o login oficial.'
+        : 'Clique no botao abaixo. O app abre o login oficial do SoundCloud e conecta sua conta.',
+      hint: 'O usuario final nao precisa preencher token, API key, pais da conta ou codigo manual.',
+      statusId: `${role}-sc-status`,
+      buttonLabel: '&#128268; Conectar SoundCloud',
+      action: `openOAuthPopup('soundcloud', '${role}')`,
+    }));
+    return wrapper;
+  }
+
+  if (!canUseNative) {
+    wrapper.appendChild(makeSoundcloudOfficialSetup(role));
+    return wrapper;
+  }
+
   wrapper.appendChild(makeAutomaticConnectPanel({
     platform: 'soundcloud',
     role,
@@ -1901,6 +2021,9 @@ function makeAppleForm(role) {
 
 function makeAmazonForm(role) {
   const wrapper = document.createElement('div');
+  const oauthConfigured = !!state.platforms.amazon?.oauth_configured;
+  const canUseNative = nativeAutomationAvailable('amazon');
+  const useOfficial = state.isCloud || oauthConfigured || !canUseNative;
 
   wrapper.appendChild(makeAutomaticConnectPanel({
     platform:    'amazon',
@@ -1911,6 +2034,14 @@ function makeAmazonForm(role) {
     statusId:    `${role}-amazon-status`,
     buttonLabel: '🔌 Conectar Amazon Music automaticamente',
     action:      `autoConnectAmazon('${role}')`,
+    subtitle:    useOfficial
+      ? 'Clique no botao abaixo. O app usa o login oficial da Amazon Music nesta versao online.'
+      : 'Clique no botao abaixo. O app abre o login do Amazon Music e conecta a conta sozinho.',
+    hint:        useOfficial
+      ? 'O usuario final nao precisa preencher token, API key, pais da conta ou codigo manual.'
+      : 'Faca login com sua conta Amazon normalmente. Nao e necessario nenhum codigo ou token.',
+    buttonLabel: useOfficial ? '&#128268; Conectar Amazon Music' : '&#128268; Conectar Amazon Music automaticamente',
+    action:      useOfficial ? `openOAuthPopup('amazon', '${role}')` : `autoConnectAmazon('${role}')`,
   }));
 
   return wrapper;
@@ -2102,6 +2233,27 @@ async function autoConnectDeezer(role) {
   const btn = document.getElementById(`${role}-deezer-auto-btn`);
   const hint = document.getElementById(`${role}-deezer-hint`);
 
+  // ── Cloud mode: webview não existe, usar OAuth ou manual ──
+  if (state.isCloud) {
+    if (state.platforms.deezer?.oauth_configured) {
+      if (status) status.innerHTML = '<span class="spin-inline"></span> Abrindo o login oficial do Deezer...';
+      openOAuthPopup('deezer', role);
+      return;
+    }
+    // Sem OAuth configurado no cloud — orientar modo manual
+    if (status) {
+      status.textContent = 'Na versao online, use o modo manual abaixo para colar o cookie ARL do Deezer.';
+    }
+    if (hint) {
+      hint.textContent = 'Abra o Deezer no seu navegador, pegue o cookie "arl" e cole no campo manual abaixo.';
+    }
+    // Abre o details do modo manual automaticamente
+    const details = document.querySelector(`#${role}-deezer-auto-btn`)?.closest('.form-panel')?.querySelector('.advanced-details');
+    if (details) details.open = true;
+    resetDeezerAutoBtn(role);
+    return;
+  }
+
   state.deezerAutoConnecting = state.deezerAutoConnecting || {};
   state.deezerAutoConnecting[role] = true;
 
@@ -2182,6 +2334,7 @@ async function autoConnectDeezer(role) {
   // Volta o foco para o PlayTransfer
   setTimeout(() => {
     try { window.focus(); } catch {}
+
   }, 1500);
 }
 
@@ -2463,6 +2616,16 @@ async function autoConnectYoutube(role) {
       return;
     }
 
+    // Cloud mode: não tenta abrir Chrome/Edge, orienta modo manual
+    if (state.isCloud) {
+      if (status) status.textContent = 'Na versao online, use o modo manual abaixo: copie o cURL do YouTube Music e cole no campo.';
+      // Abre o details do modo manual
+      const details = document.querySelector(`#${role}-ytm-auto-btn`)?.closest('.connect-form-wrapper, div')?.querySelector('.advanced-details, details');
+      if (details) details.open = true;
+      resetYoutubeAutoBtn(role);
+      return;
+    }
+
     await startYoutubeGuidedConnect(role);
   } catch (error) {
     const message = humanizePlatformError(error?.message || 'Falha ao abrir o YouTube Music automaticamente');
@@ -2504,9 +2667,8 @@ async function startYoutubeAutoConnect(role) {
       const targetUrl = d.verification_url_complete || d.verification_url || '';
       if (targetUrl) {
         const openedTab = window.open(targetUrl, '_blank', 'noopener');
-        if (!openedTab) {
-          window.location.href = targetUrl;
-          return;
+        if (!openedTab && status) {
+          status.innerHTML = `Seu navegador bloqueou o popup. <a href="${targetUrl}" target="_blank" rel="noopener" style="color:#bb86fc;text-decoration:underline;font-weight:600;">Clique aqui para abrir o login do Google</a> e volte a esta aba depois.`;
         }
       }
 
@@ -3980,6 +4142,13 @@ async function autoConnectSpotify(role) {
   if (role === 'dest') {
     if (status) status.textContent = 'Vamos ativar o login oficial do Spotify nesta instalacao.';
     if (hint) hint.textContent = 'Cole o Client ID uma vez. Depois o usuario final nao ve mais essa etapa.';
+    openSpotifyOAuthSetupModal(role);
+    return;
+  }
+
+  // Cloud mode: sem webview, pedir config OAuth ou orientar modo manual
+  if (state.isCloud) {
+    if (status) status.textContent = 'Na versao online, configure o OAuth do Spotify primeiro ou use o modo manual abaixo.';
     openSpotifyOAuthSetupModal(role);
     return;
   }
