@@ -325,6 +325,44 @@ def _looks_like_spotify_client_id(value: str) -> bool:
     return 20 <= len(value) <= 80 and all(char.isalnum() for char in value)
 
 
+def _looks_like_placeholder_secret(value: str) -> bool:
+    normalized = str(value or "").strip().strip("\"'").lower()
+    if not normalized:
+        return False
+    placeholder_markers = (
+        "client_id_do",
+        "client_secret_do",
+        "secret_do",
+        "seu_client",
+        "seu_secret",
+        "sua_secret",
+        "your_client",
+        "your_secret",
+        "placeholder",
+        "changeme",
+        "example",
+        "xxxx",
+    )
+    return any(marker in normalized for marker in placeholder_markers)
+
+
+def _has_real_config_value(value: str, min_len: int = 1) -> bool:
+    cleaned = str(value or "").strip().strip("\"'")
+    return len(cleaned) >= min_len and not _looks_like_placeholder_secret(cleaned)
+
+
+def _spotify_oauth_configured() -> bool:
+    return _has_real_config_value(SPOTIFY_CLIENT_ID, 20) and _looks_like_spotify_client_id(SPOTIFY_CLIENT_ID)
+
+
+def _deezer_oauth_configured() -> bool:
+    return _has_real_config_value(DEEZER_APP_ID, 3) and _has_real_config_value(DEEZER_SECRET_KEY, 10)
+
+
+def _soundcloud_oauth_configured() -> bool:
+    return _has_real_config_value(SOUNDCLOUD_CLIENT_ID, 10) and _has_real_config_value(SOUNDCLOUD_CLIENT_SECRET, 10)
+
+
 def _looks_like_jwt(value: str) -> bool:
     parts = [part for part in str(value or "").strip().split(".") if part]
     return len(parts) == 3
@@ -441,7 +479,7 @@ def configure_spotify_oauth():
     client_secret = str(data.get("client_secret") or "").strip()
     base_url = normalize_spotify_base_url(str(data.get("base_url") or "").strip() or get_base_url())
 
-    if not _looks_like_spotify_client_id(client_id):
+    if not _looks_like_spotify_client_id(client_id) or _looks_like_placeholder_secret(client_id):
         return jsonify({
             "ok": False,
             "error": "Cole o Client ID do app Spotify. Ele fica no Spotify Developer Dashboard.",
@@ -488,9 +526,9 @@ def configure_soundcloud_oauth():
     client_secret = str(data.get("client_secret") or "").strip()
     base_url = normalize_spotify_base_url(str(data.get("base_url") or "").strip() or get_base_url())
 
-    if len(client_id) < 10:
+    if not _has_real_config_value(client_id, 10):
         return jsonify({"ok": False, "error": "Cole o Client ID do app SoundCloud."})
-    if len(client_secret) < 10:
+    if not _has_real_config_value(client_secret, 10):
         return jsonify({"ok": False, "error": "Cole o Client Secret do app SoundCloud."})
     if any(char in client_id + client_secret for char in "\r\n"):
         return jsonify({"ok": False, "error": "Client ID ou Client Secret invalido."})
@@ -520,7 +558,7 @@ def configure_soundcloud_oauth():
 
 @app.route("/auth/spotify")
 def auth_spotify():
-    if not SPOTIFY_CLIENT_ID:
+    if not _spotify_oauth_configured():
         return redirect("/oauth-callback?error=spotify_oauth_not_configured")
 
     role = request.args.get("role", "src")
@@ -658,7 +696,7 @@ AMAZON_MUSIC_SCOPES = os.getenv(
 
 
 def amazon_music_oauth_configured() -> bool:
-    return bool(AMAZON_MUSIC_API_KEY and AMAZON_LWA_CLIENT_ID)
+    return _has_real_config_value(AMAZON_MUSIC_API_KEY, 10) and _has_real_config_value(AMAZON_LWA_CLIENT_ID, 10)
 
 
 def amazon_music_redirect_uri() -> str:
@@ -670,8 +708,8 @@ def _amazon_oauth_error_redirect(error: str, role: str = "dest"):
 
 @app.route("/auth/deezer")
 def auth_deezer():
-    if not DEEZER_APP_ID:
-        return redirect("/oauth-callback?error=deezer_oauth_not_configured")
+    if not _deezer_oauth_configured():
+        return redirect("/oauth-callback?error=deezer_oauth_not_configured&platform=deezer")
 
     role = request.args.get("role", "src")
     state = secrets.token_urlsafe(16)
@@ -755,7 +793,7 @@ def auth_deezer_callback():
 
 @app.route("/auth/soundcloud")
 def auth_soundcloud():
-    if not SOUNDCLOUD_CLIENT_ID or not SOUNDCLOUD_CLIENT_SECRET:
+    if not _soundcloud_oauth_configured():
         return redirect("/oauth-callback?error=soundcloud_oauth_not_configured&platform=soundcloud")
 
     role = request.args.get("role", "dest")
@@ -2694,16 +2732,17 @@ def api_platforms():
     p["_meta"] = {
         "is_cloud": IS_CLOUD,
         "native_automation_available": native_automation_available,
+        "public_config_allowed": (not IS_PRODUCTION) or ALLOW_PUBLIC_CONFIG_IN_PROD,
     }
     for platform_data in p.values():
         if isinstance(platform_data, dict):
             platform_data["native_automation_available"] = native_automation_available
-    p["spotify"]["oauth_configured"] = bool(SPOTIFY_CLIENT_ID)
-    p["spotify"]["oauth_mode"] = "pkce" if (SPOTIFY_CLIENT_ID and not SPOTIFY_CLIENT_SECRET) else "server"
+    p["spotify"]["oauth_configured"] = _spotify_oauth_configured()
+    p["spotify"]["oauth_mode"] = "pkce" if (p["spotify"]["oauth_configured"] and not SPOTIFY_CLIENT_SECRET) else "server"
     p["spotify"]["oauth_redirect_uri"] = build_callback_url("spotify")
-    p["deezer"]["oauth_configured"]  = bool(DEEZER_APP_ID and DEEZER_SECRET_KEY)
+    p["deezer"]["oauth_configured"]  = _deezer_oauth_configured()
     p["soundcloud"]["auto_configured"] = native_automation_available
-    p["soundcloud"]["oauth_configured"] = bool(SOUNDCLOUD_CLIENT_ID and SOUNDCLOUD_CLIENT_SECRET)
+    p["soundcloud"]["oauth_configured"] = _soundcloud_oauth_configured()
     p["soundcloud"]["oauth_redirect_uri"] = build_callback_url("soundcloud")
     p["soundcloud"]["saved_token_configured"] = bool(os.getenv("SOUNDCLOUD_ACCESS_TOKEN", "").strip())
     apple_ready = False

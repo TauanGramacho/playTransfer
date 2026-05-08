@@ -64,7 +64,21 @@ def _check_auto_available() -> None:
 
 
 def oauth_configured() -> bool:
-    return bool(YTM_OAUTH_CLIENT_ID and YTM_OAUTH_CLIENT_SECRET)
+    values = (YTM_OAUTH_CLIENT_ID, YTM_OAUTH_CLIENT_SECRET)
+    markers = (
+        "client_id_do",
+        "client_secret_do",
+        "secret_do",
+        "seu_client",
+        "seu_secret",
+        "your_client",
+        "your_secret",
+        "placeholder",
+        "changeme",
+        "example",
+        "xxxx",
+    )
+    return all(value and not any(marker in value.lower() for marker in markers) for value in values)
 
 
 def _as_text(value: Any) -> str:

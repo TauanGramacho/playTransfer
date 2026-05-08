@@ -53,6 +53,7 @@ async function loadPlatforms() {
     const r = await fetch('/api/platforms');
     state.platforms = await r.json();
     state.isCloud = !!(state.platforms._meta?.is_cloud);
+    state.publicConfigAllowed = !!(state.platforms._meta?.public_config_allowed);
   } catch (e) { console.error('Failed to load platforms', e); }
 }
 
@@ -71,7 +72,9 @@ function listenOAuthMessages() {
       const platform = d.platform || 'spotify';
       const role = d.role || 'dest';
       const message = humanizePlatformError(d.error);
-      const status = document.getElementById(`${role}-${platform}-status`);
+      const status =
+        document.getElementById(`${role}-${platform}-status`) ||
+        document.getElementById(`${role}-sc-status`);
       if (platform === 'amazon' && isAmazonOfficialAccessError(d.error)) {
         renderAmazonOfficialAccessNotice(role, d.error);
       } else if (status) {
@@ -295,6 +298,18 @@ function makeConnectCallout(config) {
   `;
 
   return div;
+}
+
+function makeCloudUnavailableForm(platform, role, detail = '') {
+  const name = state.platforms[platform]?.name || platform;
+  return makeConnectCallout({
+    platform,
+    tone: 'warning',
+    badge: 'Indisponivel no online',
+    title: `${name} precisa de login oficial no servidor`,
+    subtitle: `${name} nao permite criar playlists em conta de usuario usando uma janela aberta dentro do Fly.`,
+    note: detail || 'Quando as credenciais oficiais do app estiverem configuradas no Fly, este destino volta a conectar com um clique. Por enquanto, escolha outro destino para transferir online.',
+  });
 }
 
 function makeAdvancedDetails(summaryText, content, open = false) {
@@ -1502,6 +1517,15 @@ function makeSpotifyForm(role) {
     return wrapper;
   }
 
+  if (state.isCloud && !state.platforms.spotify?.oauth_configured && !state.publicConfigAllowed) {
+    wrapper.appendChild(makeCloudUnavailableForm(
+      'spotify',
+      role,
+      'O Spotify como destino precisa do OAuth oficial configurado no app. Depois disso, o usuario conecta pelo site oficial do Spotify.'
+    ));
+    return wrapper;
+  }
+
   wrapper.appendChild(makeSpotifyQuickConnect(role));
 
   wrapper.appendChild(makeAdvancedDetails(
@@ -1566,17 +1590,23 @@ function makeDeezerForm(role) {
   // Se OAuth está configurado, oferece OAuth primeiro + fallback manual
   if (state.platforms.deezer?.oauth_configured) {
     wrapper.appendChild(makeOAuthForm('deezer', role));
-    wrapper.appendChild(makeAdvancedDetails(
-      state.isCloud ? 'Nao funcionou? Fazer manualmente' : 'Usar modo automatico do Deezer',
-      state.isCloud ? makeDeezerCloudManualForm(role) : makeDeezerQuickConnect(role),
-      false
-    ));
+    if (!state.isCloud) {
+      wrapper.appendChild(makeAdvancedDetails(
+        'Usar modo automatico do Deezer',
+        makeDeezerQuickConnect(role),
+        false
+      ));
+    }
     return wrapper;
   }
 
   // Cloud sem OAuth: mostra direto o formulário manual amigável
   if (state.isCloud) {
-    wrapper.appendChild(makeDeezerCloudManualForm(role));
+    wrapper.appendChild(makeCloudUnavailableForm(
+      'deezer',
+      role,
+      'O Deezer como destino precisa do OAuth oficial configurado no Fly. Sem isso, a versao online nao deve pedir cookie arl para usuario final.'
+    ));
     return wrapper;
   }
 
@@ -1742,18 +1772,24 @@ function makeYoutubeQuickConnect(role) {
   const autoTrying = !!pending || !!state.youtubeAutoConnecting?.[role];
   const oauthConfigured = !!state.platforms.youtube?.oauth_configured;
   const canUseNative = nativeAutomationAvailable('youtube');
+  const usesDeviceCode = oauthConfigured && state.platforms.youtube?.oauth_mode === 'device_code';
 
   let subtitle = oauthConfigured
-    ? 'Clique no botao abaixo. O app abre o login oficial do Google e tenta concluir sozinho.'
+    ? usesDeviceCode
+      ? 'Clique no botao abaixo. O Google abre uma confirmacao segura com codigo para autorizar o YouTube Music.'
+      : 'Clique no botao abaixo. O app abre o login oficial do Google e tenta concluir sozinho.'
     : canUseNative
       ? 'Clique no botao abaixo. O app tenta usar o que ja tiver disponivel e, se precisar, abre uma janela guiada para concluir o login.'
       : 'Use o modo manual abaixo para conectar o YouTube Music nesta versao online.';
 
   let hint = oauthConfigured
-    ? 'Depois da autorizacao no Google, esta tela continua sozinha.'
+    ? usesDeviceCode
+      ? 'Confira se o codigo mostrado no Google bate com o codigo exibido aqui; depois de autorizar, esta tela continua sozinha.'
+      : 'Depois da autorizacao no Google, esta tela continua sozinha.'
     : canUseNative
       ? 'Se voce ja tiver algo valido copiado do navegador, o app aproveita. Se nao, ele abre uma janela guiada do YouTube Music e tenta terminar tudo sozinho.'
       : 'Copie o cURL da requisicao browse no seu navegador e cole no painel manual.';
+  const buttonLabel = usesDeviceCode ? 'Conectar com Google' : 'Conectar YouTube Music automaticamente';
 
   if (pending?.mode === 'oauth') {
     hint = pending.userCode
@@ -1775,7 +1811,7 @@ function makeYoutubeQuickConnect(role) {
     </div>
     <div class="manual-connect-actions deezer-quick-actions">
       <button class="btn btn-primary btn-sm deezer-auto-connect-btn" type="button" id="${role}-ytm-auto-btn" onclick="autoConnectYoutube('${role}')" ${autoTrying ? 'disabled' : ''}>
-        ${autoTrying ? '<span class="spin-inline"></span> Conectando...' : '🔌 Conectar YouTube Music automaticamente'}
+        ${autoTrying ? '<span class="spin-inline"></span> Conectando...' : buttonLabel}
       </button>
     </div>
     <div class="deezer-quick-hint" id="${role}-ytm-hint">${hint}</div>
@@ -1844,6 +1880,14 @@ function makeSoundcloudForm(role) {
   }
 
   if (!canUseNative) {
+    if (state.isCloud && !state.publicConfigAllowed) {
+      wrapper.appendChild(makeCloudUnavailableForm(
+        'soundcloud',
+        role,
+        'O SoundCloud como destino precisa de um app OAuth real configurado no Fly. Valores placeholder nao abrem login valido no SoundCloud.'
+      ));
+      return wrapper;
+    }
     wrapper.appendChild(makeSoundcloudOfficialSetup(role));
     return wrapper;
   }
@@ -2024,6 +2068,15 @@ function makeAmazonForm(role) {
   const oauthConfigured = !!state.platforms.amazon?.oauth_configured;
   const canUseNative = nativeAutomationAvailable('amazon');
   const useOfficial = state.isCloud || oauthConfigured || !canUseNative;
+
+  if (useOfficial && !oauthConfigured && state.isCloud && !state.publicConfigAllowed) {
+    wrapper.appendChild(makeCloudUnavailableForm(
+      'amazon',
+      role,
+      'Amazon Music exige acesso oficial da Amazon Music Web API para criar playlists. Esta instalacao ainda nao tem essa liberacao no Fly.'
+    ));
+    return wrapper;
+  }
 
   wrapper.appendChild(makeAutomaticConnectPanel({
     platform:    'amazon',
@@ -2570,7 +2623,9 @@ function resetYoutubeAutoBtn(role) {
   const btn = document.getElementById(`${role}-ytm-auto-btn`);
   if (btn) {
     btn.disabled = false;
-    btn.innerHTML = '🔌 Conectar YouTube Music automaticamente';
+    btn.innerHTML = state.platforms.youtube?.oauth_mode === 'device_code'
+      ? 'Conectar com Google'
+      : 'Conectar YouTube Music automaticamente';
   }
 }
 
@@ -3773,6 +3828,10 @@ function humanizePlatformError(message) {
     return 'O login automatico do Spotify ainda nao foi ativado nesta instalacao.';
   }
 
+  if (lowered.includes('deezer_oauth_not_configured')) {
+    return 'O Deezer como destino ainda nao tem login oficial configurado nesta instalacao online.';
+  }
+
   if (lowered.includes('spotify_oauth_required_for_destination')) {
     return 'Para usar Spotify como destino, falta configurar o login oficial do Spotify no PlayTransfer. Depois disso, o usuario conecta com um clique.';
   }
@@ -3824,7 +3883,11 @@ function humanizePlatformError(message) {
     lowered.includes('soundcloud_oauth_not_configured') ||
     lowered.includes('soundcloud_oauth_required_for_destination')
   ) {
-    return 'Conecte o SoundCloud pelo botao automatico antes de iniciar a transferencia.';
+    return 'O SoundCloud como destino ainda nao tem login oficial valido configurado nesta instalacao online.';
+  }
+
+  if (lowered.includes('native_automation_unavailable_in_cloud')) {
+    return 'Este modo automatico dependia de abrir uma janela no computador local e nao funciona dentro do Fly.';
   }
 
   if (lowered.includes('soundcloud_token_exchange_failed')) {
@@ -4037,6 +4100,7 @@ function renderPlatformGrids() {
   if (destSoon) destSoon.innerHTML = '';
 
   Object.entries(platforms).forEach(([key, platform]) => {
+    if (key.startsWith('_')) return;
     srcGrid.appendChild(makePlatformCard(key, platform, 'src', !platform.can_read));
     destGrid.appendChild(makePlatformCard(key, platform, 'dest', !platform.can_write));
   });
